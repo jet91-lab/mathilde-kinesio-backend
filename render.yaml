@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mathilde-kinesio-api
+    runtime: node
+    rootDir: .
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_PASSWORD
+        generateValue: false
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_URL
+        value: https://alequilibre-kinesio.fr
