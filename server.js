@@ -44,9 +44,10 @@ const LUNCH_END   = '14:00';
 const GAP_MINUTES = 15; // intervalle entre RDV
 
 const SESSION_DURATIONS = {
-  'decouverte': 60,  // 1h
-  'ado':        60,  // 1h
-  'kinesio':    90,  // 1h30 (durée max pour bloquer assez de temps)
+  'decouverte':  60,  // 1h
+  'ado':         60,  // 1h
+  'kinesio':     90,  // 1h30
+  'aromatouch':  60,  // 1h
 };
 
 function timeToMinutes(t) {
