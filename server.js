@@ -609,7 +609,11 @@ app.put('/api/admin/notification-prefs', requireAuth, (req, res) => {
 });
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-app.get('/api/health', (_, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+app.get('/api/health', (_, res) => res.json({
+  status: 'ok',
+  time: new Date().toISOString(),
+  apnConfigured: apnProvider !== null,
+}));
 
 // ── START ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`));
