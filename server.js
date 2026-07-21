@@ -137,12 +137,27 @@ function generateDaySlots(dateStr, durationMinutes) {
 // Config à définir dans les variables d'env Render une fois la clé APNs générée
 // depuis le compte développeur Apple : APN_KEY (contenu du .p8, ou APN_KEY_PATH
 // vers un fichier), APN_KEY_ID, APN_TEAM_ID, APN_BUNDLE_ID, APN_PRODUCTION=true.
+//
+// node-apn traite toute valeur `string` passée à `token.key` comme un CHEMIN
+// DE FICHIER (fs.readFileSync dessus) — jamais comme le contenu brut de la
+// clé. Donc si on fournit le contenu du .p8 via APN_KEY, il faut le passer en
+// Buffer pour qu'il soit traité comme des données, pas comme un chemin.
+function resolveAPNKey() {
+  if (process.env.APN_KEY_PATH) return process.env.APN_KEY_PATH;
+  if (!process.env.APN_KEY) return null;
+  const normalized = process.env.APN_KEY.includes('\\n')
+    ? process.env.APN_KEY.replace(/\\n/g, '\n')
+    : process.env.APN_KEY;
+  return Buffer.from(normalized, 'utf8');
+}
+
 let apnProvider = null;
-if (process.env.APN_KEY_ID && process.env.APN_TEAM_ID && (process.env.APN_KEY || process.env.APN_KEY_PATH)) {
+const apnKey = resolveAPNKey();
+if (process.env.APN_KEY_ID && process.env.APN_TEAM_ID && apnKey) {
   try {
     apnProvider = new apn.Provider({
       token: {
-        key: process.env.APN_KEY || process.env.APN_KEY_PATH,
+        key: apnKey,
         keyId: process.env.APN_KEY_ID,
         teamId: process.env.APN_TEAM_ID,
       },
