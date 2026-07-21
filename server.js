@@ -5,8 +5,13 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
+const apn = require('@parse/node-apn');
 
 const app = express();
+// Derrière le proxy Render : nécessaire pour que express-rate-limit
+// identifie la vraie IP client (X-Forwarded-For)
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
@@ -20,10 +25,43 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// ── RATE LIMITING ─────────────────────────────────────────────────────────────
+// Réservations : 10 tentatives par IP par heure
+app.use('/api/book', rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { error: 'Trop de tentatives, réessayez dans une heure.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+// Connexion admin : 5 tentatives par IP par 15 minutes
+app.use('/api/admin/login', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Trop de tentatives de connexion, réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+// Créneaux : 60 requêtes par IP par minute (navigation calendrier)
+app.use('/api/slots', rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { error: 'Trop de requêtes, réessayez dans une minute.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
 // ── DATA FILES ────────────────────────────────────────────────────────────────
 const DATA_DIR = path.join(__dirname, 'data');
 const BOOKINGS_FILE = path.join(DATA_DIR, 'bookings.json');
 const BLOCKS_FILE = path.join(DATA_DIR, 'blocks.json');
+const CLIENTS_FILE = path.join(DATA_DIR, 'clients.json');
+const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
+const PREFS_FILE = path.join(DATA_DIR, 'notification-prefs.json');
+
+const DEFAULT_PREFS = { newBooking: true, dailyRecap: true, dailyRecapTime: '19:00', lastRecapSentDate: null };
 
 function readJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -32,6 +70,15 @@ function readJSON(file) {
 
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function readPrefs() {
+  try { return { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8')) }; }
+  catch { return { ...DEFAULT_PREFS }; }
+}
+
+function writePrefs(prefs) {
+  writeJSON(PREFS_FILE, prefs);
 }
 
 // ── DISPONIBILITÉS DE BASE ────────────────────────────────────────────────────
@@ -44,8 +91,10 @@ const LUNCH_END   = '14:00';
 const GAP_MINUTES = 15; // intervalle entre RDV
 
 const SESSION_DURATIONS = {
-  'premiere': 90,  // 1h30
-  'suivi':    60,  // 1h
+  'decouverte':  60,  // 1h
+  'ado':         60,  // 1h
+  'kinesio':     90,  // 1h30
+  'aromatouch':  60,  // 1h
 };
 
 function timeToMinutes(t) {
@@ -83,6 +132,87 @@ function generateDaySlots(dateStr, durationMinutes) {
   }
   return slots;
 }
+
+// ── NOTIFICATIONS PUSH (APNs) ─────────────────────────────────────────────────
+// Config à définir dans les variables d'env Render une fois la clé APNs générée
+// depuis le compte développeur Apple : APN_KEY (contenu du .p8, ou APN_KEY_PATH
+// vers un fichier), APN_KEY_ID, APN_TEAM_ID, APN_BUNDLE_ID, APN_PRODUCTION=true.
+let apnProvider = null;
+if (process.env.APN_KEY_ID && process.env.APN_TEAM_ID && (process.env.APN_KEY || process.env.APN_KEY_PATH)) {
+  try {
+    apnProvider = new apn.Provider({
+      token: {
+        key: process.env.APN_KEY || process.env.APN_KEY_PATH,
+        keyId: process.env.APN_KEY_ID,
+        teamId: process.env.APN_TEAM_ID,
+      },
+      production: process.env.APN_PRODUCTION === 'true',
+    });
+    console.log('APNs configuré.');
+  } catch (e) {
+    console.error('Erreur de configuration APNs :', e.message);
+  }
+} else {
+  console.log('APNs non configuré (variables d\'env manquantes) — notifications push désactivées.');
+}
+
+async function sendPush(title, body) {
+  if (!apnProvider) return;
+  const devices = readJSON(DEVICES_FILE);
+  if (!devices.length) return;
+
+  const note = new apn.Notification();
+  note.alert = { title, body };
+  note.sound = 'default';
+  note.topic = process.env.APN_BUNDLE_ID;
+
+  const result = await apnProvider.send(note, devices.map(d => d.deviceToken));
+
+  // Purge les tokens invalides (désinstallation, expiration…)
+  const invalidTokens = new Set(
+    result.failed
+      .filter(f => ['BadDeviceToken', 'Unregistered'].includes(f.response?.reason))
+      .map(f => f.device)
+  );
+  if (invalidTokens.size) {
+    writeJSON(DEVICES_FILE, devices.filter(d => !invalidTokens.has(d.deviceToken)));
+  }
+}
+
+// ── RÉCAP QUOTIDIEN ────────────────────────────────────────────────────────────
+// Vérifie chaque minute si c'est l'heure d'envoyer le récap du lendemain.
+// Nécessite que le fuseau du serveur Render corresponde à Europe/Paris
+// (variable d'env TZ=Europe/Paris) pour que l'heure choisie soit correcte.
+function checkDailyRecap() {
+  const prefs = readPrefs();
+  if (!prefs.dailyRecap) return;
+
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const currentTime = `${hh}:${mm}`;
+  const today = now.toISOString().slice(0, 10);
+
+  if (currentTime !== prefs.dailyRecapTime || prefs.lastRecapSentDate === today) return;
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowStr = tomorrow.toISOString().slice(0, 10);
+
+  const bookings = readJSON(BOOKINGS_FILE)
+    .filter(b => b.date === tomorrowStr && b.status !== 'cancelled')
+    .sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+  prefs.lastRecapSentDate = today;
+  writePrefs(prefs);
+
+  if (!bookings.length) return;
+
+  const list = bookings.map(b => `${b.startTime.replace(':00', 'h')} ${b.firstName} ${b.lastName[0]}.`).join(', ');
+  sendPush(`Demain : ${bookings.length} RDV`, list).catch(e => console.error('Erreur envoi récap :', e.message));
+}
+
+setInterval(checkDailyRecap, 60 * 1000);
 
 // ── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -254,6 +384,15 @@ app.post('/api/book', (req, res) => {
     bookingId: booking.id,
     message: 'Réservation confirmée',
   });
+
+  const prefs = readPrefs();
+  if (prefs.newBooking) {
+    const typeLabel = { decouverte: 'Découverte', ado: 'Ado', kinesio: 'Kinésio', aromatouch: 'AromaTouch' }[type] || type;
+    sendPush(
+      'Nouveau RDV',
+      `${booking.firstName} ${booking.lastName} — ${booking.date} à ${booking.startTime} (${typeLabel})`
+    ).catch(e => console.error('Erreur envoi push :', e.message));
+  }
 });
 
 // ── ROUTES ADMIN ──────────────────────────────────────────────────────────────
@@ -264,7 +403,8 @@ app.post('/api/admin/login', (req, res) => {
   if (!password || password !== ADMIN_PASSWORD) {
     return res.status(401).json({ error: 'Mot de passe incorrect' });
   }
-  const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '12h' });
+  // 30 jours : usage quotidien depuis l'app mobile en plus du web
+  const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '30d' });
   res.json({ token });
 });
 
@@ -339,6 +479,133 @@ app.delete('/api/admin/blocks/:id', requireAuth, (req, res) => {
   }
   writeJSON(BLOCKS_FILE, filtered);
   res.json({ success: true });
+});
+
+// ── APPAREILS (notifications push) ─────────────────────────────────────────────
+
+// POST /api/admin/device-token
+app.post('/api/admin/device-token', requireAuth, (req, res) => {
+  const { deviceToken, platform, label } = req.body;
+  if (!deviceToken) return res.status(400).json({ error: 'deviceToken requis' });
+
+  const devices = readJSON(DEVICES_FILE);
+  const existing = devices.find(d => d.deviceToken === deviceToken);
+  if (existing) {
+    existing.label = label || existing.label;
+    existing.platform = platform || existing.platform;
+  } else {
+    devices.push({ deviceToken, platform: platform || 'ios', label: label || '', registeredAt: new Date().toISOString() });
+  }
+  writeJSON(DEVICES_FILE, devices);
+  res.status(201).json({ success: true });
+});
+
+// DELETE /api/admin/device-token/:token
+app.delete('/api/admin/device-token/:token', requireAuth, (req, res) => {
+  const devices = readJSON(DEVICES_FILE);
+  const filtered = devices.filter(d => d.deviceToken !== req.params.token);
+  writeJSON(DEVICES_FILE, filtered);
+  res.json({ success: true });
+});
+
+// ── CLIENTS ────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/clients — liste agrégée depuis les réservations + notes
+app.get('/api/admin/clients', requireAuth, (req, res) => {
+  const bookings = readJSON(BOOKINGS_FILE);
+  const clientsNotes = readJSON(CLIENTS_FILE);
+
+  const byEmail = new Map();
+  for (const b of bookings) {
+    const existing = byEmail.get(b.email);
+    if (!existing || b.date > existing.lastSessionDate) {
+      byEmail.set(b.email, {
+        email: b.email,
+        firstName: b.firstName,
+        lastName: b.lastName,
+        phone: b.phone,
+        lastSessionDate: b.date,
+        totalSessions: (existing ? existing.totalSessions : 0) + 1,
+      });
+    } else {
+      existing.totalSessions += 1;
+    }
+  }
+
+  const clients = Array.from(byEmail.values()).map(c => {
+    const note = clientsNotes.find(n => n.email === c.email);
+    return { ...c, notes: note ? note.notes : '' };
+  });
+
+  clients.sort((a, b) => b.lastSessionDate.localeCompare(a.lastSessionDate));
+  res.json(clients);
+});
+
+// GET /api/admin/clients/:email — fiche détaillée
+app.get('/api/admin/clients/:email', requireAuth, (req, res) => {
+  const email = req.params.email.toLowerCase();
+  const bookings = readJSON(BOOKINGS_FILE)
+    .filter(b => b.email === email)
+    .sort((a, b) => b.date.localeCompare(a.date) || b.startTime.localeCompare(a.startTime));
+
+  if (!bookings.length) return res.status(404).json({ error: 'Client introuvable' });
+
+  const clientsNotes = readJSON(CLIENTS_FILE);
+  const note = clientsNotes.find(n => n.email === email);
+  const latest = bookings[0];
+
+  res.json({
+    email,
+    firstName: latest.firstName,
+    lastName: latest.lastName,
+    phone: latest.phone,
+    notes: note ? note.notes : '',
+    bookings,
+  });
+});
+
+// PUT /api/admin/clients/:email/notes
+app.put('/api/admin/clients/:email/notes', requireAuth, (req, res) => {
+  const email = req.params.email.toLowerCase();
+  const { notes } = req.body;
+  if (typeof notes !== 'string') return res.status(400).json({ error: 'notes requis (string)' });
+
+  const clientsNotes = readJSON(CLIENTS_FILE);
+  const existing = clientsNotes.find(n => n.email === email);
+  if (existing) {
+    existing.notes = notes;
+    existing.updatedAt = new Date().toISOString();
+  } else {
+    clientsNotes.push({ email, notes, updatedAt: new Date().toISOString() });
+  }
+  writeJSON(CLIENTS_FILE, clientsNotes);
+  res.json({ success: true });
+});
+
+// ── PRÉFÉRENCES DE NOTIFICATION ─────────────────────────────────────────────────
+
+// GET /api/admin/notification-prefs
+app.get('/api/admin/notification-prefs', requireAuth, (req, res) => {
+  const { lastRecapSentDate, ...prefs } = readPrefs();
+  res.json(prefs);
+});
+
+// PUT /api/admin/notification-prefs
+app.put('/api/admin/notification-prefs', requireAuth, (req, res) => {
+  const { newBooking, dailyRecap, dailyRecapTime } = req.body;
+
+  if (dailyRecapTime !== undefined && !/^([01]\d|2[0-3]):[0-5]\d$/.test(dailyRecapTime)) {
+    return res.status(400).json({ error: 'dailyRecapTime invalide (format HH:MM)' });
+  }
+
+  const prefs = readPrefs();
+  if (typeof newBooking === 'boolean') prefs.newBooking = newBooking;
+  if (typeof dailyRecap === 'boolean') prefs.dailyRecap = dailyRecap;
+  if (dailyRecapTime) prefs.dailyRecapTime = dailyRecapTime;
+  writePrefs(prefs);
+
+  const { lastRecapSentDate, ...publicPrefs } = prefs;
+  res.json(publicPrefs);
 });
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
