@@ -304,6 +304,63 @@ app.get('/api/slots', async (req, res) => {
   res.json({ date, type, slots: available });
 });
 
+// Vérifie qu'un créneau (date/startTime/endTime) est libre : ni réservé par une
+// autre réservation confirmée, ni bloqué. `excludeBookingId` permet à une
+// réservation d'ignorer son propre créneau lors d'une modification.
+async function checkSlotAvailable(date, startTime, endTime, type, excludeBookingId = null) {
+  const duration = SESSION_DURATIONS[type] || 60;
+  const allSlots = generateDaySlots(date, duration);
+  const slotExists = allSlots.some(s => s.start === startTime && s.end === endTime);
+  if (!slotExists) {
+    return 'Ce créneau n\'est pas disponible pour ce type de séance';
+  }
+
+  const bookings = await db.collection('bookings').find({ date }, NO_ID_PROJECTION).toArray();
+  const blocks   = await db.collection('blocks').find({}, NO_ID_PROJECTION).toArray();
+  const dateObj  = new Date(date + 'T00:00:00');
+  const dow      = dateObj.getDay();
+  const reqStart = timeToMinutes(startTime);
+  const reqEnd   = timeToMinutes(endTime);
+
+  // Conflits réservations
+  const conflict = bookings.some(b =>
+    b.status !== 'cancelled' &&
+    b.id !== excludeBookingId &&
+    reqStart < timeToMinutes(b.endTime) &&
+    reqEnd   > timeToMinutes(b.startTime)
+  );
+  if (conflict) {
+    return 'Ce créneau vient d\'être réservé';
+  }
+
+  // Conflits blocages
+  for (const bl of blocks) {
+    if (bl.type === 'day' && bl.date === date) {
+      return 'Cette journée est bloquée';
+    }
+    if (bl.type === 'slot' && bl.date === date) {
+      const bStart = timeToMinutes(bl.startTime);
+      const bEnd   = timeToMinutes(bl.endTime);
+      if (reqStart < bEnd && reqEnd > bStart) {
+        return 'Ce créneau est bloqué';
+      }
+    }
+    if (bl.type === 'recurring') {
+      const recStart = new Date(bl.startDate + 'T00:00:00');
+      const recEnd   = bl.endDate ? new Date(bl.endDate + 'T00:00:00') : null;
+      if (dateObj >= recStart && (!recEnd || dateObj <= recEnd) && bl.dayOfWeek === dow) {
+        const bStart = timeToMinutes(bl.startTime);
+        const bEnd   = timeToMinutes(bl.endTime);
+        if (reqStart < bEnd && reqEnd > bStart) {
+          return 'Ce créneau est bloqué';
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 // POST /api/book
 app.post('/api/book', async (req, res) => {
   const { date, startTime, endTime, type, firstName, lastName, email, phone } = req.body;
@@ -319,54 +376,9 @@ app.post('/api/book', async (req, res) => {
     return res.status(400).json({ error: 'Email invalide' });
   }
 
-  // Vérifier que le créneau est encore dispo (re-check côté serveur)
-  const duration = SESSION_DURATIONS[type] || 60;
-  const allSlots = generateDaySlots(date, duration);
-  const slotExists = allSlots.some(s => s.start === startTime && s.end === endTime);
-  if (!slotExists) {
-    return res.status(409).json({ error: 'Ce créneau n\'est pas disponible pour ce type de séance' });
-  }
-
-  const bookings = await db.collection('bookings').find({ date }, NO_ID_PROJECTION).toArray();
-  const blocks   = await db.collection('blocks').find({}, NO_ID_PROJECTION).toArray();
-  const dateObj  = new Date(date + 'T00:00:00');
-  const dow      = dateObj.getDay();
-  const reqStart = timeToMinutes(startTime);
-  const reqEnd   = timeToMinutes(endTime);
-
-  // Conflits réservations
-  const conflict = bookings.some(b =>
-    b.status !== 'cancelled' &&
-    reqStart < timeToMinutes(b.endTime) &&
-    reqEnd   > timeToMinutes(b.startTime)
-  );
-  if (conflict) {
-    return res.status(409).json({ error: 'Ce créneau vient d\'être réservé' });
-  }
-
-  // Conflits blocages
-  for (const bl of blocks) {
-    if (bl.type === 'day' && bl.date === date) {
-      return res.status(409).json({ error: 'Cette journée est bloquée' });
-    }
-    if (bl.type === 'slot' && bl.date === date) {
-      const bStart = timeToMinutes(bl.startTime);
-      const bEnd   = timeToMinutes(bl.endTime);
-      if (reqStart < bEnd && reqEnd > bStart) {
-        return res.status(409).json({ error: 'Ce créneau est bloqué' });
-      }
-    }
-    if (bl.type === 'recurring') {
-      const recStart = new Date(bl.startDate + 'T00:00:00');
-      const recEnd   = bl.endDate ? new Date(bl.endDate + 'T00:00:00') : null;
-      if (dateObj >= recStart && (!recEnd || dateObj <= recEnd) && bl.dayOfWeek === dow) {
-        const bStart = timeToMinutes(bl.startTime);
-        const bEnd   = timeToMinutes(bl.endTime);
-        if (reqStart < bEnd && reqEnd > bStart) {
-          return res.status(409).json({ error: 'Ce créneau est bloqué' });
-        }
-      }
-    }
+  const conflictError = await checkSlotAvailable(date, startTime, endTime, type);
+  if (conflictError) {
+    return res.status(409).json({ error: conflictError });
   }
 
   const booking = {
@@ -439,6 +451,43 @@ app.post('/api/admin/bookings/:id/cancel', requireAuth, async (req, res) => {
   );
   if (result.matchedCount === 0) return res.status(404).json({ error: 'Réservation introuvable' });
   res.json({ success: true });
+});
+
+// PUT /api/admin/bookings/:id — reprogrammer / corriger une réservation
+app.put('/api/admin/bookings/:id', requireAuth, async (req, res) => {
+  const existing = await db.collection('bookings').findOne({ id: req.params.id }, NO_ID_PROJECTION);
+  if (!existing) return res.status(404).json({ error: 'Réservation introuvable' });
+
+  const { date, startTime, endTime, type, firstName, lastName, email, phone } = req.body;
+
+  if (!date || !startTime || !endTime || !type || !firstName || !lastName || !email || !phone) {
+    return res.status(400).json({ error: 'Champs manquants' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'Date invalide' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Email invalide' });
+  }
+
+  const conflictError = await checkSlotAvailable(date, startTime, endTime, type, existing.id);
+  if (conflictError) {
+    return res.status(409).json({ error: conflictError });
+  }
+
+  const updated = {
+    date,
+    startTime,
+    endTime,
+    type,
+    firstName: firstName.trim(),
+    lastName:  lastName.trim(),
+    email:     email.trim().toLowerCase(),
+    phone:     phone.trim(),
+  };
+
+  await db.collection('bookings').updateOne({ id: req.params.id }, { $set: updated });
+  res.json({ success: true, booking: { ...existing, ...updated } });
 });
 
 // GET /api/admin/blocks
@@ -536,8 +585,14 @@ app.get('/api/admin/clients', requireAuth, async (req, res) => {
   }
 
   const clients = Array.from(byEmail.values()).map(c => {
-    const note = clientsNotes.find(n => n.email === c.email);
-    return { ...c, notes: note ? note.notes : '' };
+    const profile = clientsNotes.find(n => n.email === c.email);
+    return {
+      ...c,
+      firstName: profile?.firstName || c.firstName,
+      lastName:  profile?.lastName  || c.lastName,
+      phone:     profile?.phone     || c.phone,
+      notes: profile ? profile.notes || '' : '',
+    };
   });
 
   clients.sort((a, b) => b.lastSessionDate.localeCompare(a.lastSessionDate));
@@ -552,17 +607,35 @@ app.get('/api/admin/clients/:email', requireAuth, async (req, res) => {
 
   if (!bookings.length) return res.status(404).json({ error: 'Client introuvable' });
 
-  const note = await db.collection('clients').findOne({ email }, NO_ID_PROJECTION);
+  const profile = await db.collection('clients').findOne({ email }, NO_ID_PROJECTION);
   const latest = bookings[0];
 
   res.json({
     email,
-    firstName: latest.firstName,
-    lastName: latest.lastName,
-    phone: latest.phone,
-    notes: note ? note.notes : '',
+    firstName: profile?.firstName || latest.firstName,
+    lastName:  profile?.lastName  || latest.lastName,
+    phone:     profile?.phone     || latest.phone,
+    notes: profile ? profile.notes || '' : '',
     bookings,
   });
+});
+
+// PUT /api/admin/clients/:email/profile — corrige prénom/nom/téléphone
+app.put('/api/admin/clients/:email/profile', requireAuth, async (req, res) => {
+  const email = req.params.email.toLowerCase();
+  const { firstName, lastName, phone } = req.body;
+
+  const update = { updatedAt: new Date().toISOString() };
+  if (typeof firstName === 'string' && firstName.trim()) update.firstName = firstName.trim();
+  if (typeof lastName === 'string' && lastName.trim())   update.lastName  = lastName.trim();
+  if (typeof phone === 'string' && phone.trim())         update.phone    = phone.trim();
+
+  await db.collection('clients').updateOne(
+    { email },
+    { $set: update, $setOnInsert: { email } },
+    { upsert: true }
+  );
+  res.json({ success: true });
 });
 
 // PUT /api/admin/clients/:email/notes
