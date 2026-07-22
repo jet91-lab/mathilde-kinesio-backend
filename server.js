@@ -19,7 +19,7 @@ const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: [FRONTEND_URL, 'http://localhost:3000', 'http://127.0.0.1:5500'],
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json());
@@ -444,6 +444,46 @@ app.get('/api/admin/bookings', requireAuth, async (req, res) => {
   const bookings = await db.collection('bookings').find(filter, NO_ID_PROJECTION).toArray();
   bookings.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
   res.json(bookings);
+});
+
+// POST /api/admin/bookings — création manuelle par Mathilde depuis l'app.
+// Distincte de /api/book (publique) : pas de limite de débit, et pas de
+// notification push (inutile de s'auto-alerter d'un RDV qu'on vient de saisir).
+app.post('/api/admin/bookings', requireAuth, async (req, res) => {
+  const { date, startTime, endTime, type, firstName, lastName, email, phone } = req.body;
+
+  if (!date || !startTime || !endTime || !type || !firstName || !lastName || !email || !phone) {
+    return res.status(400).json({ error: 'Champs manquants' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'Date invalide' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Email invalide' });
+  }
+
+  const conflictError = await checkSlotAvailable(date, startTime, endTime, type);
+  if (conflictError) {
+    return res.status(409).json({ error: conflictError });
+  }
+
+  const booking = {
+    id: uuidv4(),
+    date,
+    startTime,
+    endTime,
+    type,
+    firstName: firstName.trim(),
+    lastName:  lastName.trim(),
+    email:     email.trim().toLowerCase(),
+    phone:     phone.trim(),
+    status: 'confirmed',
+    createdAt: new Date().toISOString(),
+  };
+
+  await db.collection('bookings').insertOne(booking);
+  delete booking._id;
+  res.status(201).json({ success: true, bookingId: booking.id });
 });
 
 // POST /api/admin/bookings/:id/cancel
