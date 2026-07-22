@@ -238,9 +238,10 @@ function requireAuth(req, res, next) {
 
 // ── ROUTES PUBLIQUES ──────────────────────────────────────────────────────────
 
-// GET /api/slots?date=YYYY-MM-DD&type=premiere|suivi
+// GET /api/slots?date=YYYY-MM-DD&type=premiere|suivi&excludeId=... (excludeId : pour
+// laisser réapparaître le créneau d'une réservation en cours de modification)
 app.get('/api/slots', async (req, res) => {
-  const { date, type = 'suivi' } = req.query;
+  const { date, type = 'suivi', excludeId } = req.query;
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return res.status(400).json({ error: 'Paramètre date invalide (YYYY-MM-DD)' });
   }
@@ -251,7 +252,9 @@ app.get('/api/slots', async (req, res) => {
     return res.json({ date, slots: [] });
   }
 
-  const bookings = await db.collection('bookings').find({ date, status: { $ne: 'cancelled' } }, NO_ID_PROJECTION).toArray();
+  const bookingFilter = { date, status: { $ne: 'cancelled' } };
+  if (excludeId) bookingFilter.id = { $ne: excludeId };
+  const bookings = await db.collection('bookings').find(bookingFilter, NO_ID_PROJECTION).toArray();
   const blocks   = await db.collection('blocks').find({}, NO_ID_PROJECTION).toArray();
 
   // Construire liste des intervalles occupés ce jour-là
