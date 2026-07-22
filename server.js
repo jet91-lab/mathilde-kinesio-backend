@@ -532,6 +532,42 @@ app.post('/api/admin/block', requireAuth, async (req, res) => {
   res.status(201).json({ success: true, block });
 });
 
+// PUT /api/admin/blocks/:id — modifier un blocage existant
+app.put('/api/admin/blocks/:id', requireAuth, async (req, res) => {
+  const existing = await db.collection('blocks').findOne({ id: req.params.id }, NO_ID_PROJECTION);
+  if (!existing) return res.status(404).json({ error: 'Blocage introuvable' });
+
+  const { type, date, startTime, endTime, startDate, endDate, dayOfWeek, reason } = req.body;
+
+  if (!type || !['day', 'slot', 'recurring'].includes(type)) {
+    return res.status(400).json({ error: 'Type invalide (day | slot | recurring)' });
+  }
+
+  const updated = { type, reason: reason || '' };
+
+  if (type === 'day') {
+    if (!date) return res.status(400).json({ error: 'Date requise' });
+    updated.date = date;
+  } else if (type === 'slot') {
+    if (!date || !startTime || !endTime) return res.status(400).json({ error: 'Date, startTime et endTime requis' });
+    updated.date = date;
+    updated.startTime = startTime;
+    updated.endTime = endTime;
+  } else if (type === 'recurring') {
+    if (!startDate || !startTime || !endTime || dayOfWeek === undefined) {
+      return res.status(400).json({ error: 'startDate, startTime, endTime, dayOfWeek requis' });
+    }
+    updated.startDate = startDate;
+    updated.endDate = endDate || null;
+    updated.startTime = startTime;
+    updated.endTime = endTime;
+    updated.dayOfWeek = Number(dayOfWeek);
+  }
+
+  await db.collection('blocks').replaceOne({ id: req.params.id }, { id: existing.id, ...updated, createdAt: existing.createdAt });
+  res.json({ success: true, block: { id: existing.id, ...updated, createdAt: existing.createdAt } });
+});
+
 // DELETE /api/admin/blocks/:id
 app.delete('/api/admin/blocks/:id', requireAuth, async (req, res) => {
   const result = await db.collection('blocks').deleteOne({ id: req.params.id });
