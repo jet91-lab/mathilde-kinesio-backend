@@ -14,7 +14,8 @@
     "dotenv": "^16.3.1",
     "uuid": "^9.0.0",
     "express-rate-limit": "^7.4.0",
-    "@parse/node-apn": "^6.5.0"
+    "@parse/node-apn": "^6.5.0",
+    "mongodb": "^6.10.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

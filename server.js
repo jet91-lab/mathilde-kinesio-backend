@@ -3,10 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
-const path = require('path');
 const rateLimit = require('express-rate-limit');
 const apn = require('@parse/node-apn');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 // Derrière le proxy Render : nécessaire pour que express-rate-limit
@@ -53,32 +52,30 @@ app.use('/api/slots', rateLimit({
   legacyHeaders: false,
 }));
 
-// ── DATA FILES ────────────────────────────────────────────────────────────────
-const DATA_DIR = path.join(__dirname, 'data');
-const BOOKINGS_FILE = path.join(DATA_DIR, 'bookings.json');
-const BLOCKS_FILE = path.join(DATA_DIR, 'blocks.json');
-const CLIENTS_FILE = path.join(DATA_DIR, 'clients.json');
-const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
-const PREFS_FILE = path.join(DATA_DIR, 'notification-prefs.json');
+// ── BASE DE DONNÉES (MongoDB Atlas) ─────────────────────────────────────────────
+// Le disque local de Render (offre gratuite/Starter) est éphémère : tout fichier
+// écrit sur disque est perdu à chaque redémarrage du serveur. D'où le passage à
+// une vraie base de données persistante plutôt que des fichiers JSON.
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'equilibre';
 
+let db = null;
+let mongoClient = null;
+
+const NO_ID_PROJECTION = { projection: { _id: 0 } };
 const DEFAULT_PREFS = { newBooking: true, dailyRecap: true, dailyRecapTime: '19:00', lastRecapSentDate: null };
 
-function readJSON(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch { return []; }
+async function getPrefs() {
+  const doc = await db.collection('prefs').findOne({ _id: 'notification-prefs' });
+  return { ...DEFAULT_PREFS, ...(doc || {}) };
 }
 
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
-}
-
-function readPrefs() {
-  try { return { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(PREFS_FILE, 'utf8')) }; }
-  catch { return { ...DEFAULT_PREFS }; }
-}
-
-function writePrefs(prefs) {
-  writeJSON(PREFS_FILE, prefs);
+async function savePrefs(prefs) {
+  await db.collection('prefs').updateOne(
+    { _id: 'notification-prefs' },
+    { $set: prefs },
+    { upsert: true }
+  );
 }
 
 // ── DISPONIBILITÉS DE BASE ────────────────────────────────────────────────────
@@ -173,7 +170,7 @@ if (process.env.APN_KEY_ID && process.env.APN_TEAM_ID && apnKey) {
 
 async function sendPush(title, body) {
   if (!apnProvider) return;
-  const devices = readJSON(DEVICES_FILE);
+  const devices = await db.collection('devices').find({}, NO_ID_PROJECTION).toArray();
   if (!devices.length) return;
 
   const note = new apn.Notification();
@@ -184,13 +181,11 @@ async function sendPush(title, body) {
   const result = await apnProvider.send(note, devices.map(d => d.deviceToken));
 
   // Purge les tokens invalides (désinstallation, expiration…)
-  const invalidTokens = new Set(
-    result.failed
-      .filter(f => ['BadDeviceToken', 'Unregistered'].includes(f.response?.reason))
-      .map(f => f.device)
-  );
-  if (invalidTokens.size) {
-    writeJSON(DEVICES_FILE, devices.filter(d => !invalidTokens.has(d.deviceToken)));
+  const invalidTokens = result.failed
+    .filter(f => ['BadDeviceToken', 'Unregistered'].includes(f.response?.reason))
+    .map(f => f.device);
+  if (invalidTokens.length) {
+    await db.collection('devices').deleteMany({ deviceToken: { $in: invalidTokens } });
   }
 }
 
@@ -198,8 +193,8 @@ async function sendPush(title, body) {
 // Vérifie chaque minute si c'est l'heure d'envoyer le récap du lendemain.
 // Nécessite que le fuseau du serveur Render corresponde à Europe/Paris
 // (variable d'env TZ=Europe/Paris) pour que l'heure choisie soit correcte.
-function checkDailyRecap() {
-  const prefs = readPrefs();
+async function checkDailyRecap() {
+  const prefs = await getPrefs();
   if (!prefs.dailyRecap) return;
 
   const now = new Date();
@@ -214,20 +209,18 @@ function checkDailyRecap() {
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = tomorrow.toISOString().slice(0, 10);
 
-  const bookings = readJSON(BOOKINGS_FILE)
-    .filter(b => b.date === tomorrowStr && b.status !== 'cancelled')
+  const bookings = (await db.collection('bookings')
+    .find({ date: tomorrowStr, status: { $ne: 'cancelled' } }, NO_ID_PROJECTION)
+    .toArray())
     .sort((a, b) => a.startTime.localeCompare(b.startTime));
 
-  prefs.lastRecapSentDate = today;
-  writePrefs(prefs);
+  await savePrefs({ ...prefs, lastRecapSentDate: today });
 
   if (!bookings.length) return;
 
   const list = bookings.map(b => `${b.startTime.replace(':00', 'h')} ${b.firstName} ${b.lastName[0]}.`).join(', ');
   sendPush(`Demain : ${bookings.length} RDV`, list).catch(e => console.error('Erreur envoi récap :', e.message));
 }
-
-setInterval(checkDailyRecap, 60 * 1000);
 
 // ── AUTH MIDDLEWARE ───────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -246,7 +239,7 @@ function requireAuth(req, res, next) {
 // ── ROUTES PUBLIQUES ──────────────────────────────────────────────────────────
 
 // GET /api/slots?date=YYYY-MM-DD&type=premiere|suivi
-app.get('/api/slots', (req, res) => {
+app.get('/api/slots', async (req, res) => {
   const { date, type = 'suivi' } = req.query;
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return res.status(400).json({ error: 'Paramètre date invalide (YYYY-MM-DD)' });
@@ -258,8 +251,8 @@ app.get('/api/slots', (req, res) => {
     return res.json({ date, slots: [] });
   }
 
-  const bookings = readJSON(BOOKINGS_FILE).filter(b => b.date === date && b.status !== 'cancelled');
-  const blocks   = readJSON(BLOCKS_FILE);
+  const bookings = await db.collection('bookings').find({ date, status: { $ne: 'cancelled' } }, NO_ID_PROJECTION).toArray();
+  const blocks   = await db.collection('blocks').find({}, NO_ID_PROJECTION).toArray();
 
   // Construire liste des intervalles occupés ce jour-là
   const busyIntervals = [];
@@ -312,7 +305,7 @@ app.get('/api/slots', (req, res) => {
 });
 
 // POST /api/book
-app.post('/api/book', (req, res) => {
+app.post('/api/book', async (req, res) => {
   const { date, startTime, endTime, type, firstName, lastName, email, phone } = req.body;
 
   // Validation basique
@@ -334,8 +327,8 @@ app.post('/api/book', (req, res) => {
     return res.status(409).json({ error: 'Ce créneau n\'est pas disponible pour ce type de séance' });
   }
 
-  const bookings = readJSON(BOOKINGS_FILE);
-  const blocks   = readJSON(BLOCKS_FILE);
+  const bookings = await db.collection('bookings').find({ date }, NO_ID_PROJECTION).toArray();
+  const blocks   = await db.collection('blocks').find({}, NO_ID_PROJECTION).toArray();
   const dateObj  = new Date(date + 'T00:00:00');
   const dow      = dateObj.getDay();
   const reqStart = timeToMinutes(startTime);
@@ -343,7 +336,6 @@ app.post('/api/book', (req, res) => {
 
   // Conflits réservations
   const conflict = bookings.some(b =>
-    b.date === date &&
     b.status !== 'cancelled' &&
     reqStart < timeToMinutes(b.endTime) &&
     reqEnd   > timeToMinutes(b.startTime)
@@ -391,8 +383,8 @@ app.post('/api/book', (req, res) => {
     createdAt: new Date().toISOString(),
   };
 
-  bookings.push(booking);
-  writeJSON(BOOKINGS_FILE, bookings);
+  await db.collection('bookings').insertOne(booking);
+  delete booking._id;
 
   res.status(201).json({
     success: true,
@@ -400,7 +392,7 @@ app.post('/api/book', (req, res) => {
     message: 'Réservation confirmée',
   });
 
-  const prefs = readPrefs();
+  const prefs = await getPrefs();
   if (prefs.newBooking) {
     const typeLabel = { decouverte: 'Découverte', ado: 'Ado', kinesio: 'Kinésio', aromatouch: 'AromaTouch' }[type] || type;
     sendPush(
@@ -424,41 +416,44 @@ app.post('/api/admin/login', (req, res) => {
 });
 
 // GET /api/admin/bookings?from=YYYY-MM-DD&to=YYYY-MM-DD
-app.get('/api/admin/bookings', requireAuth, (req, res) => {
-  let bookings = readJSON(BOOKINGS_FILE);
+app.get('/api/admin/bookings', requireAuth, async (req, res) => {
   const { from, to, status } = req.query;
-  if (from) bookings = bookings.filter(b => b.date >= from);
-  if (to)   bookings = bookings.filter(b => b.date <= to);
-  if (status) bookings = bookings.filter(b => b.status === status);
+  const filter = {};
+  if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = from;
+    if (to)   filter.date.$lte = to;
+  }
+  if (status) filter.status = status;
+
+  const bookings = await db.collection('bookings').find(filter, NO_ID_PROJECTION).toArray();
   bookings.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
   res.json(bookings);
 });
 
 // POST /api/admin/bookings/:id/cancel
-app.post('/api/admin/bookings/:id/cancel', requireAuth, (req, res) => {
-  const bookings = readJSON(BOOKINGS_FILE);
-  const idx = bookings.findIndex(b => b.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Réservation introuvable' });
-  bookings[idx].status = 'cancelled';
-  bookings[idx].cancelledAt = new Date().toISOString();
-  writeJSON(BOOKINGS_FILE, bookings);
+app.post('/api/admin/bookings/:id/cancel', requireAuth, async (req, res) => {
+  const result = await db.collection('bookings').updateOne(
+    { id: req.params.id },
+    { $set: { status: 'cancelled', cancelledAt: new Date().toISOString() } }
+  );
+  if (result.matchedCount === 0) return res.status(404).json({ error: 'Réservation introuvable' });
   res.json({ success: true });
 });
 
 // GET /api/admin/blocks
-app.get('/api/admin/blocks', requireAuth, (req, res) => {
-  res.json(readJSON(BLOCKS_FILE));
+app.get('/api/admin/blocks', requireAuth, async (req, res) => {
+  res.json(await db.collection('blocks').find({}, NO_ID_PROJECTION).toArray());
 });
 
 // POST /api/admin/block
-app.post('/api/admin/block', requireAuth, (req, res) => {
+app.post('/api/admin/block', requireAuth, async (req, res) => {
   const { type, date, startTime, endTime, startDate, endDate, dayOfWeek, reason } = req.body;
 
   if (!type || !['day', 'slot', 'recurring'].includes(type)) {
     return res.status(400).json({ error: 'Type invalide (day | slot | recurring)' });
   }
 
-  const blocks = readJSON(BLOCKS_FILE);
   const block = { id: uuidv4(), type, reason: reason || '', createdAt: new Date().toISOString() };
 
   if (type === 'day') {
@@ -480,55 +475,48 @@ app.post('/api/admin/block', requireAuth, (req, res) => {
     block.dayOfWeek  = Number(dayOfWeek);
   }
 
-  blocks.push(block);
-  writeJSON(BLOCKS_FILE, blocks);
+  await db.collection('blocks').insertOne(block);
+  delete block._id;
   res.status(201).json({ success: true, block });
 });
 
 // DELETE /api/admin/blocks/:id
-app.delete('/api/admin/blocks/:id', requireAuth, (req, res) => {
-  const blocks = readJSON(BLOCKS_FILE);
-  const filtered = blocks.filter(b => b.id !== req.params.id);
-  if (filtered.length === blocks.length) {
-    return res.status(404).json({ error: 'Blocage introuvable' });
-  }
-  writeJSON(BLOCKS_FILE, filtered);
+app.delete('/api/admin/blocks/:id', requireAuth, async (req, res) => {
+  const result = await db.collection('blocks').deleteOne({ id: req.params.id });
+  if (result.deletedCount === 0) return res.status(404).json({ error: 'Blocage introuvable' });
   res.json({ success: true });
 });
 
 // ── APPAREILS (notifications push) ─────────────────────────────────────────────
 
 // POST /api/admin/device-token
-app.post('/api/admin/device-token', requireAuth, (req, res) => {
+app.post('/api/admin/device-token', requireAuth, async (req, res) => {
   const { deviceToken, platform, label } = req.body;
   if (!deviceToken) return res.status(400).json({ error: 'deviceToken requis' });
 
-  const devices = readJSON(DEVICES_FILE);
-  const existing = devices.find(d => d.deviceToken === deviceToken);
-  if (existing) {
-    existing.label = label || existing.label;
-    existing.platform = platform || existing.platform;
-  } else {
-    devices.push({ deviceToken, platform: platform || 'ios', label: label || '', registeredAt: new Date().toISOString() });
-  }
-  writeJSON(DEVICES_FILE, devices);
+  await db.collection('devices').updateOne(
+    { deviceToken },
+    {
+      $set: { platform: platform || 'ios', label: label || '' },
+      $setOnInsert: { deviceToken, registeredAt: new Date().toISOString() },
+    },
+    { upsert: true }
+  );
   res.status(201).json({ success: true });
 });
 
 // DELETE /api/admin/device-token/:token
-app.delete('/api/admin/device-token/:token', requireAuth, (req, res) => {
-  const devices = readJSON(DEVICES_FILE);
-  const filtered = devices.filter(d => d.deviceToken !== req.params.token);
-  writeJSON(DEVICES_FILE, filtered);
+app.delete('/api/admin/device-token/:token', requireAuth, async (req, res) => {
+  await db.collection('devices').deleteOne({ deviceToken: req.params.token });
   res.json({ success: true });
 });
 
 // ── CLIENTS ────────────────────────────────────────────────────────────────────
 
 // GET /api/admin/clients — liste agrégée depuis les réservations + notes
-app.get('/api/admin/clients', requireAuth, (req, res) => {
-  const bookings = readJSON(BOOKINGS_FILE);
-  const clientsNotes = readJSON(CLIENTS_FILE);
+app.get('/api/admin/clients', requireAuth, async (req, res) => {
+  const bookings = await db.collection('bookings').find({}, NO_ID_PROJECTION).toArray();
+  const clientsNotes = await db.collection('clients').find({}, NO_ID_PROJECTION).toArray();
 
   const byEmail = new Map();
   for (const b of bookings) {
@@ -557,16 +545,14 @@ app.get('/api/admin/clients', requireAuth, (req, res) => {
 });
 
 // GET /api/admin/clients/:email — fiche détaillée
-app.get('/api/admin/clients/:email', requireAuth, (req, res) => {
+app.get('/api/admin/clients/:email', requireAuth, async (req, res) => {
   const email = req.params.email.toLowerCase();
-  const bookings = readJSON(BOOKINGS_FILE)
-    .filter(b => b.email === email)
+  const bookings = (await db.collection('bookings').find({ email }, NO_ID_PROJECTION).toArray())
     .sort((a, b) => b.date.localeCompare(a.date) || b.startTime.localeCompare(a.startTime));
 
   if (!bookings.length) return res.status(404).json({ error: 'Client introuvable' });
 
-  const clientsNotes = readJSON(CLIENTS_FILE);
-  const note = clientsNotes.find(n => n.email === email);
+  const note = await db.collection('clients').findOne({ email }, NO_ID_PROJECTION);
   const latest = bookings[0];
 
   res.json({
@@ -580,44 +566,40 @@ app.get('/api/admin/clients/:email', requireAuth, (req, res) => {
 });
 
 // PUT /api/admin/clients/:email/notes
-app.put('/api/admin/clients/:email/notes', requireAuth, (req, res) => {
+app.put('/api/admin/clients/:email/notes', requireAuth, async (req, res) => {
   const email = req.params.email.toLowerCase();
   const { notes } = req.body;
   if (typeof notes !== 'string') return res.status(400).json({ error: 'notes requis (string)' });
 
-  const clientsNotes = readJSON(CLIENTS_FILE);
-  const existing = clientsNotes.find(n => n.email === email);
-  if (existing) {
-    existing.notes = notes;
-    existing.updatedAt = new Date().toISOString();
-  } else {
-    clientsNotes.push({ email, notes, updatedAt: new Date().toISOString() });
-  }
-  writeJSON(CLIENTS_FILE, clientsNotes);
+  await db.collection('clients').updateOne(
+    { email },
+    { $set: { notes, updatedAt: new Date().toISOString() }, $setOnInsert: { email } },
+    { upsert: true }
+  );
   res.json({ success: true });
 });
 
 // ── PRÉFÉRENCES DE NOTIFICATION ─────────────────────────────────────────────────
 
 // GET /api/admin/notification-prefs
-app.get('/api/admin/notification-prefs', requireAuth, (req, res) => {
-  const { lastRecapSentDate, ...prefs } = readPrefs();
+app.get('/api/admin/notification-prefs', requireAuth, async (req, res) => {
+  const { lastRecapSentDate, ...prefs } = await getPrefs();
   res.json(prefs);
 });
 
 // PUT /api/admin/notification-prefs
-app.put('/api/admin/notification-prefs', requireAuth, (req, res) => {
+app.put('/api/admin/notification-prefs', requireAuth, async (req, res) => {
   const { newBooking, dailyRecap, dailyRecapTime } = req.body;
 
   if (dailyRecapTime !== undefined && !/^([01]\d|2[0-3]):[0-5]\d$/.test(dailyRecapTime)) {
     return res.status(400).json({ error: 'dailyRecapTime invalide (format HH:MM)' });
   }
 
-  const prefs = readPrefs();
+  const prefs = await getPrefs();
   if (typeof newBooking === 'boolean') prefs.newBooking = newBooking;
   if (typeof dailyRecap === 'boolean') prefs.dailyRecap = dailyRecap;
   if (dailyRecapTime) prefs.dailyRecapTime = dailyRecapTime;
-  writePrefs(prefs);
+  await savePrefs(prefs);
 
   const { lastRecapSentDate, ...publicPrefs } = prefs;
   res.json(publicPrefs);
@@ -628,7 +610,38 @@ app.get('/api/health', (_, res) => res.json({
   status: 'ok',
   time: new Date().toISOString(),
   apnConfigured: apnProvider !== null,
+  dbConnected: db !== null,
 }));
 
 // ── START ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`));
+async function start() {
+  if (!MONGODB_URI) {
+    console.error('MONGODB_URI manquant — impossible de démarrer sans base de données.');
+    process.exit(1);
+  }
+
+  mongoClient = new MongoClient(MONGODB_URI);
+  await mongoClient.connect();
+  db = mongoClient.db(MONGODB_DB_NAME);
+
+  // Index utiles (idempotent : sans effet si déjà créés)
+  await db.collection('bookings').createIndex({ id: 1 }, { unique: true });
+  await db.collection('bookings').createIndex({ date: 1 });
+  await db.collection('bookings').createIndex({ email: 1 });
+  await db.collection('blocks').createIndex({ id: 1 }, { unique: true });
+  await db.collection('clients').createIndex({ email: 1 }, { unique: true });
+  await db.collection('devices').createIndex({ deviceToken: 1 }, { unique: true });
+
+  console.log('Connecté à MongoDB.');
+
+  setInterval(() => {
+    checkDailyRecap().catch(e => console.error('Erreur récap quotidien :', e.message));
+  }, 60 * 1000);
+
+  app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`));
+}
+
+start().catch(e => {
+  console.error('Échec du démarrage :', e.message);
+  process.exit(1);
+});
