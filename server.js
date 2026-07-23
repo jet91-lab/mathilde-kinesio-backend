@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit');
 const apn = require('@parse/node-apn');
 const { MongoClient } = require('mongodb');
+const Stripe = require('stripe');
 
 const app = express();
 // Derrière le proxy Render : nécessaire pour que express-rate-limit
@@ -22,6 +23,66 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+
+// ── STRIPE (bons cadeaux) ───────────────────────────────────────────────────────
+// Le webhook a besoin du corps brut (non parsé) pour vérifier la signature
+// Stripe : sa route doit donc être déclarée AVANT app.use(express.json()),
+// qui parserait sinon le body en JSON avant qu'on puisse le vérifier.
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(503).send('Stripe non configuré');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook signature invalide : ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    try {
+      const existing = await db.collection('giftCertificates').findOne({ stripeSessionId: session.id });
+      if (!existing) {
+        const meta = session.metadata || {};
+        const now = new Date();
+        const expires = new Date(now);
+        expires.setFullYear(expires.getFullYear() + 1);
+
+        const cert = {
+          id: uuidv4(),
+          code: await generateUniqueGiftCode(),
+          type: meta.type,
+          amount: (session.amount_total || 0) / 100,
+          purchaserName: meta.purchaserName || '',
+          purchaserEmail: session.customer_details?.email || meta.purchaserEmail || '',
+          recipientName: meta.recipientName || '',
+          message: meta.message || '',
+          status: 'paid',
+          stripeSessionId: session.id,
+          createdAt: now.toISOString(),
+          expiresAt: expires.toISOString(),
+          redeemedAt: null,
+          redeemedBookingId: null,
+        };
+        await db.collection('giftCertificates').insertOne(cert);
+        sendPush(
+          'Bon cadeau vendu 🎁',
+          `${TYPE_LABELS[cert.type] || cert.type} — ${cert.amount} € pour ${cert.recipientName || cert.purchaserName}`
+        ).catch(e => console.error('Erreur envoi push bon cadeau :', e.message));
+      }
+    } catch (e) {
+      console.error('Erreur traitement webhook Stripe :', e.message);
+      return res.status(500).send('Erreur interne');
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 
 // ── RATE LIMITING ─────────────────────────────────────────────────────────────
@@ -93,6 +154,38 @@ const SESSION_DURATIONS = {
   'kinesio':     90,  // 1h30
   'aromatouch':  60,  // 1h
 };
+
+// Doit rester aligné avec SessionPricing.swift (app) et les tarifs affichés sur le site.
+const SESSION_PRICES = {
+  'decouverte':  50,
+  'ado':         50,
+  'kinesio':     70,
+  'aromatouch':  70,
+};
+
+const TYPE_LABELS = {
+  decouverte: 'Découverte',
+  ado:        'Ado',
+  kinesio:    'Kinésio',
+  aromatouch: 'AromaTouch',
+};
+
+// Sans caractères ambigus (0/O, 1/I/L) pour rester lisible sur un bon imprimé.
+const GIFT_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+function generateGiftCode() {
+  let raw = '';
+  for (let i = 0; i < 8; i++) raw += GIFT_CODE_CHARS[Math.floor(Math.random() * GIFT_CODE_CHARS.length)];
+  return `EQUI-${raw.slice(0, 4)}-${raw.slice(4)}`;
+}
+
+async function generateUniqueGiftCode() {
+  let code;
+  do {
+    code = generateGiftCode();
+  } while (await db.collection('giftCertificates').findOne({ code }));
+  return code;
+}
 
 function timeToMinutes(t) {
   const [h, m] = t.split(':').map(Number);
@@ -364,9 +457,20 @@ async function checkSlotAvailable(date, startTime, endTime, type, excludeBooking
   return null;
 }
 
+// Vérifie qu'un code cadeau existe, est encore valide (payé, non utilisé, non expiré)
+// et correspond bien au type de séance réservé (le montant payé doit couvrir le type choisi).
+async function validateGiftCode(code, type) {
+  const cert = await db.collection('giftCertificates').findOne({ code: code.trim().toUpperCase() });
+  if (!cert) return 'Code cadeau introuvable';
+  if (cert.status === 'redeemed') return 'Ce bon cadeau a déjà été utilisé';
+  if (new Date(cert.expiresAt) < new Date()) return 'Ce bon cadeau a expiré';
+  if (cert.type !== type) return `Ce bon cadeau est valable uniquement pour une séance « ${TYPE_LABELS[cert.type] || cert.type} »`;
+  return null;
+}
+
 // POST /api/book
 app.post('/api/book', async (req, res) => {
-  const { date, startTime, endTime, type, firstName, lastName, email, phone } = req.body;
+  const { date, startTime, endTime, type, firstName, lastName, email, phone, giftCode } = req.body;
 
   // Validation basique
   if (!date || !startTime || !endTime || !type || !firstName || !lastName || !email || !phone) {
@@ -384,6 +488,13 @@ app.post('/api/book', async (req, res) => {
     return res.status(409).json({ error: conflictError });
   }
 
+  let giftCert = null;
+  if (giftCode) {
+    const codeError = await validateGiftCode(giftCode, type);
+    if (codeError) return res.status(400).json({ error: codeError });
+    giftCert = giftCode.trim().toUpperCase();
+  }
+
   const booking = {
     id: uuidv4(),
     date,
@@ -395,11 +506,19 @@ app.post('/api/book', async (req, res) => {
     email:     email.trim().toLowerCase(),
     phone:     phone.trim(),
     status: 'confirmed',
+    giftCode: giftCert,
     createdAt: new Date().toISOString(),
   };
 
   await db.collection('bookings').insertOne(booking);
   delete booking._id;
+
+  if (giftCert) {
+    await db.collection('giftCertificates').updateOne(
+      { code: giftCert },
+      { $set: { status: 'redeemed', redeemedAt: new Date().toISOString(), redeemedBookingId: booking.id } }
+    );
+  }
 
   res.status(201).json({
     success: true,
@@ -409,7 +528,7 @@ app.post('/api/book', async (req, res) => {
 
   const prefs = await getPrefs();
   if (prefs.newBooking) {
-    const typeLabel = { decouverte: 'Découverte', ado: 'Ado', kinesio: 'Kinésio', aromatouch: 'AromaTouch' }[type] || type;
+    const typeLabel = TYPE_LABELS[type] || type;
     sendPush(
       'Nouveau RDV',
       `${booking.firstName} ${booking.lastName} — ${booking.date} à ${booking.startTime} (${typeLabel})`
@@ -639,6 +758,92 @@ app.delete('/api/admin/device-token/:token', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// ── BONS CADEAUX ──────────────────────────────────────────────────────────────
+
+// POST /api/gift-certificates/checkout — crée une session de paiement Stripe
+app.post('/api/gift-certificates/checkout', async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Paiement en ligne indisponible pour le moment' });
+
+  const { type, recipientName, message, purchaserName, purchaserEmail } = req.body;
+
+  if (!type || !SESSION_PRICES[type]) {
+    return res.status(400).json({ error: 'Type de séance invalide' });
+  }
+  if (!purchaserName || !purchaserEmail) {
+    return res.status(400).json({ error: 'Nom et email requis' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(purchaserEmail)) {
+    return res.status(400).json({ error: 'Email invalide' });
+  }
+
+  const amount = SESSION_PRICES[type];
+  // Origine du site appelant, pour rediriger après paiement vers le même domaine
+  // (utile aussi bien en prod qu'en test local).
+  const origin = req.headers.origin || 'https://alequilibre-kinesio.fr';
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      customer_email: purchaserEmail,
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: {
+            name: `Bon cadeau — ${TYPE_LABELS[type]}`,
+            description: 'À l\'équilibre · Mathilde Bourgoin',
+          },
+          unit_amount: Math.round(amount * 100),
+        },
+        quantity: 1,
+      }],
+      metadata: {
+        type,
+        recipientName: (recipientName || '').slice(0, 200),
+        message: (message || '').slice(0, 500),
+        purchaserName: purchaserName.slice(0, 200),
+        purchaserEmail,
+      },
+      success_url: `${origin}/cadeau-succes.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/cadeau.html`,
+    });
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error('Erreur création session Stripe :', e.message);
+    res.status(500).json({ error: 'Impossible de créer le paiement pour le moment' });
+  }
+});
+
+// GET /api/gift-certificates/session/:sessionId — la page de succès l'interroge
+// pour afficher le code une fois le webhook traité (peut arriver quelques
+// secondes après la redirection).
+app.get('/api/gift-certificates/session/:sessionId', async (req, res) => {
+  const cert = await db.collection('giftCertificates').findOne({ stripeSessionId: req.params.sessionId }, NO_ID_PROJECTION);
+  if (!cert) return res.status(404).json({ error: 'pending' });
+  res.json(cert);
+});
+
+// GET /api/admin/gift-certificates
+app.get('/api/admin/gift-certificates', requireAuth, async (req, res) => {
+  const certs = await db.collection('giftCertificates').find({}, NO_ID_PROJECTION).toArray();
+  certs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  res.json(certs);
+});
+
+// POST /api/admin/gift-certificates/:code/redeem — usage manuel (code présenté en personne)
+app.post('/api/admin/gift-certificates/:code/redeem', requireAuth, async (req, res) => {
+  const code = req.params.code.trim().toUpperCase();
+  const cert = await db.collection('giftCertificates').findOne({ code });
+  if (!cert) return res.status(404).json({ error: 'Bon cadeau introuvable' });
+  if (cert.status === 'redeemed') return res.status(409).json({ error: 'Ce bon cadeau a déjà été utilisé' });
+
+  await db.collection('giftCertificates').updateOne(
+    { code },
+    { $set: { status: 'redeemed', redeemedAt: new Date().toISOString() } }
+  );
+  res.json({ success: true });
+});
+
 // ── CLIENTS ────────────────────────────────────────────────────────────────────
 
 // GET /api/admin/clients — liste agrégée depuis les réservations + notes
@@ -763,6 +968,7 @@ app.get('/api/health', (_, res) => res.json({
   time: new Date().toISOString(),
   apnConfigured: apnProvider !== null,
   dbConnected: db !== null,
+  stripeConfigured: stripe !== null,
 }));
 
 // ── START ─────────────────────────────────────────────────────────────────────
@@ -783,6 +989,8 @@ async function start() {
   await db.collection('blocks').createIndex({ id: 1 }, { unique: true });
   await db.collection('clients').createIndex({ email: 1 }, { unique: true });
   await db.collection('devices').createIndex({ deviceToken: 1 }, { unique: true });
+  await db.collection('giftCertificates').createIndex({ code: 1 }, { unique: true });
+  await db.collection('giftCertificates').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
 
   console.log('Connecté à MongoDB.');
 
