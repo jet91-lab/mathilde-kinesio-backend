@@ -228,7 +228,9 @@ const SESSION_DURATIONS = {
   'aromatouch':  60,  // 1h
 };
 
-// Doit rester aligné avec SessionPricing.swift (app) et les tarifs affichés sur le site.
+// Source de vérité unique des tarifs : l'app iOS les récupère via GET /api/config
+// au lieu de les redéclarer. Les modifier ici suffit — plus de risque de voir les
+// statistiques calculées sur d'anciens prix sans que rien ne le signale.
 const SESSION_PRICES = {
   'decouverte':  50,
   'ado':         50,
@@ -242,6 +244,126 @@ const TYPE_LABELS = {
   kinesio:    'Kinésio',
   aromatouch: 'AromaTouch',
 };
+
+// ── ÉTAT D'UNE SÉANCE (présence, encaissement, note de suivi) ─────────────────
+//
+// Principe : une séance passée est présumée **honorée et réglée au tarif
+// habituel**. On ne stocke donc que les écarts à ce cas normal. Conséquence
+// directe : les réservations déjà en base restent valides telles quelles et
+// **aucune migration n'est nécessaire** — l'absence de champ `session` se lit
+// comme « tout s'est passé normalement ».
+//
+// booking.session = {
+//   note:       string,                               // suivi — donnée sensible, purgée avec le reste
+//   attendance: 'attended' | 'noshow',                // absent → présumé honoré
+//   payment:    'paid' | 'unpaid' | 'gift' | 'free',  // absent → présumé réglé
+//   amount:     number,                               // absent → tarif du type de séance
+//   method:     'cash' | 'card' | 'transfer' | 'check',
+//   updatedAt:  string ISO,
+// }
+const ATTENDANCE_VALUES = ['attended', 'noshow'];
+const PAYMENT_VALUES    = ['paid', 'unpaid', 'gift', 'free'];
+const PAYMENT_METHODS   = ['cash', 'card', 'transfer', 'check'];
+
+/// Ce qui compte réellement dans le chiffre d'affaires.
+/// - `gift` est exclu volontairement : le bon cadeau a déjà été encaissé via
+///   Stripe à l'achat. L'inclure ici compterait la même somme deux fois.
+/// - `free` (séance offerte) et `unpaid` (pas encore réglée) sont exclus aussi,
+///   mais restent visibles dans l'export pour pouvoir être relancés.
+function sessionState(booking, today) {
+  const s = booking.session || {};
+  const cancelled = booking.status === 'cancelled';
+  const isPast = booking.date < today;
+
+  const attendance = s.attendance || (cancelled ? 'cancelled' : (isPast ? 'attended' : 'upcoming'));
+  const payment = s.payment || (attendance === 'attended' ? 'paid' : 'none');
+  const amount = typeof s.amount === 'number' ? s.amount : (SESSION_PRICES[booking.type] ?? 0);
+  const counted = attendance === 'attended' && payment === 'paid';
+
+  return {
+    attendance,
+    payment,
+    amount,
+    method: s.method || null,
+    note: s.note || '',
+    // Montant réellement acquis. Une séance non honorée, offerte, impayée ou
+    // réglée par bon cadeau vaut 0 dans le chiffre d'affaires.
+    revenue: counted ? amount : 0,
+    isExplicit: Object.keys(s).length > 0,
+  };
+}
+
+/// Échappement CSV : une cellule contenant `;`, un guillemet ou un saut de ligne
+/// doit être encadrée de guillemets, les guillemets internes étant doublés.
+/// Sans cela, un nom comme `Dupont; Marie` décalerait toute la ligne.
+function csvCell(value) {
+  const text = String(value ?? '');
+  return /[";\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/// Joint l'état calculé à une réservation avant de l'envoyer à l'app.
+/// L'app affiche `sessionState` sans rejouer la règle de présomption : une seule
+/// implémentation, donc pas de divergence possible entre le chiffre du serveur
+/// (export comptable) et celui affiché à l'écran.
+function withSessionState(booking) {
+  return { ...booking, sessionState: sessionState(booking, parisNow().day) };
+}
+
+/// Champs de dossier client. `contraindications` et `reason` sont des données de
+/// santé : elles vivent dans la collection `clients`, que la purge RGPD supprime
+/// intégralement — rien de plus à prévoir de ce côté.
+function validateClientProfile(body) {
+  for (const field of ['firstName', 'lastName', 'phone', 'reason', 'contraindications']) {
+    const value = body[field];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'string') return `${field} doit être une chaîne`;
+    if (value.length > 2000) return `${field} trop long (2000 caractères maximum)`;
+  }
+
+  const { birthDate } = body;
+  if (birthDate !== undefined && birthDate !== null && String(birthDate).trim() !== '') {
+    if (typeof birthDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) {
+      return 'birthDate doit être au format YYYY-MM-DD';
+    }
+    // `new Date('2026-02-31')` ne lève pas : il glisse au 3 mars. On recompare
+    // donc la date reformatée pour rejeter un jour qui n'existe pas.
+    const parsed = new Date(`${birthDate}T12:00:00Z`);
+    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== birthDate) {
+      return 'birthDate n\'est pas une date valide';
+    }
+    if (birthDate > new Date().toISOString().slice(0, 10)) {
+      return 'birthDate ne peut pas être dans le futur';
+    }
+    if (birthDate < '1900-01-01') return 'birthDate est trop ancienne';
+  }
+  return null;
+}
+
+function validateSessionPatch(body) {
+  if (body.note !== undefined && typeof body.note !== 'string') {
+    return 'note doit être une chaîne';
+  }
+  if (body.note !== undefined && body.note.length > 5000) {
+    return 'note trop longue (5000 caractères maximum)';
+  }
+  if (body.attendance !== undefined && body.attendance !== null
+      && !ATTENDANCE_VALUES.includes(body.attendance)) {
+    return `attendance doit valoir ${ATTENDANCE_VALUES.join(' ou ')}`;
+  }
+  if (body.payment !== undefined && body.payment !== null
+      && !PAYMENT_VALUES.includes(body.payment)) {
+    return `payment doit valoir ${PAYMENT_VALUES.join(', ')}`;
+  }
+  if (body.method !== undefined && body.method !== null
+      && !PAYMENT_METHODS.includes(body.method)) {
+    return `method doit valoir ${PAYMENT_METHODS.join(', ')}`;
+  }
+  if (body.amount !== undefined && body.amount !== null
+      && (typeof body.amount !== 'number' || !Number.isFinite(body.amount) || body.amount < 0)) {
+    return 'amount doit être un nombre positif';
+  }
+  return null;
+}
 
 // Sans caractères ambigus (0/O, 1/I/L) pour rester lisible sur un bon imprimé.
 const GIFT_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -549,6 +671,11 @@ async function purgeExpiredPersonalData() {
           phone: '',
           anonymisedAt: new Date().toISOString(),
         },
+        // La note de suivi est la donnée la plus sensible du dossier : elle doit
+        // disparaître, pas survivre à l'anonymisation de l'identité. Les données
+        // comptables (montant, règlement) sont conservées — elles n'identifient
+        // personne et l'obligation de conservation comptable est plus longue.
+        $unset: { 'session.note': '' },
       }
     );
     count += result.modifiedCount;
@@ -830,7 +957,7 @@ app.get('/api/admin/bookings', requireAuth, wrap(async (req, res) => {
 
   const bookings = await db.collection('bookings').find(filter, NO_ID_PROJECTION).toArray();
   bookings.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
-  res.json(bookings);
+  res.json(bookings.map(withSessionState));
 }));
 
 // POST /api/admin/bookings — création manuelle par Mathilde depuis l'app.
@@ -887,6 +1014,82 @@ app.post('/api/admin/bookings/:id/cancel', requireAuth, wrap(async (req, res) =>
   );
   if (result.matchedCount === 0) return res.status(404).json({ error: 'Réservation introuvable' });
   res.json({ success: true });
+}));
+
+// PUT /api/admin/bookings/:id/session — note de suivi, présence, encaissement
+//
+// Écriture partielle : seuls les champs présents dans le corps sont modifiés.
+// Envoyer `null` sur `attendance` ou `payment` efface l'exception et fait
+// retomber la séance dans le cas présumé (honorée / réglée).
+app.put('/api/admin/bookings/:id/session', requireAuth, wrap(async (req, res) => {
+  const shapeError = validateSessionPatch(req.body || {});
+  if (shapeError) return res.status(400).json({ error: shapeError });
+
+  const existing = await db.collection('bookings').findOne({ id: req.params.id }, NO_ID_PROJECTION);
+  if (!existing) return res.status(404).json({ error: 'Réservation introuvable' });
+
+  const session = { ...(existing.session || {}) };
+  for (const field of ['note', 'attendance', 'payment', 'method', 'amount']) {
+    if (!(field in req.body)) continue;
+    const value = req.body[field];
+    // `null` ou chaîne vide = revenir au comportement par défaut, sans laisser
+    // traîner une clé vide qui ferait passer la séance pour « renseignée ».
+    if (value === null || value === '') delete session[field];
+    else session[field] = value;
+  }
+
+  const update = Object.keys(session).length
+    ? { $set: { session: { ...session, updatedAt: new Date().toISOString() } } }
+    : { $unset: { session: '' } };
+
+  await db.collection('bookings').updateOne({ id: req.params.id }, update);
+
+  const updated = await db.collection('bookings').findOne({ id: req.params.id }, NO_ID_PROJECTION);
+  res.json({ success: true, session: sessionState(updated, parisNow().day) });
+}));
+
+// GET /api/admin/export?from=&to= — export comptable au format CSV
+app.get('/api/admin/export', requireAuth, wrap(async (req, res) => {
+  const from = queryString(req.query.from);
+  const to   = queryString(req.query.to);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return res.status(400).json({ error: 'Paramètres from et to requis au format YYYY-MM-DD' });
+  }
+
+  const bookings = (await db.collection('bookings')
+    .find({ date: { $gte: from, $lte: to } }, NO_ID_PROJECTION)
+    .toArray())
+    .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+
+  const today = parisNow().day;
+  const rows = [['Date', 'Heure', 'Client', 'Prestation', 'Statut', 'Règlement', 'Moyen', 'Montant encaissé']];
+
+  for (const b of bookings) {
+    const state = sessionState(b, today);
+    if (state.attendance === 'upcoming') continue; // pas encore eu lieu : hors comptabilité
+    rows.push([
+      b.date,
+      b.startTime,
+      `${b.firstName} ${b.lastName}`.trim(),
+      TYPE_LABELS[b.type] || b.type,
+      { attended: 'Honorée', noshow: 'Absence', cancelled: 'Annulée' }[state.attendance] || state.attendance,
+      { paid: 'Réglée', unpaid: 'En attente', gift: 'Bon cadeau', free: 'Offerte', none: '' }[state.payment] || '',
+      { cash: 'Espèces', card: 'Carte', transfer: 'Virement', check: 'Chèque' }[state.method] || '',
+      state.revenue.toFixed(2).replace('.', ','), // séparateur décimal français, pour Excel/Numbers en FR
+    ]);
+  }
+
+  const total = bookings.reduce((sum, b) => sum + sessionState(b, today).revenue, 0);
+  rows.push([]);
+  rows.push(['', '', '', '', '', '', 'Total encaissé', total.toFixed(2).replace('.', ',')]);
+
+  // Point-virgule : séparateur attendu par Excel en locale française.
+  // BOM UTF-8 : sans lui, Excel affiche « SÃ©ance » au lieu de « Séance ».
+  const csv = '\uFEFF' + rows.map(row => row.map(csvCell).join(';')).join('\r\n');
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="seances-${from}_${to}.csv"`);
+  res.send(csv);
 }));
 
 // PUT /api/admin/bookings/:id — reprogrammer / corriger une réservation
@@ -1181,25 +1384,42 @@ app.get('/api/admin/clients/:email', requireAuth, wrap(async (req, res) => {
     lastName:  profile?.lastName  || latest.lastName,
     phone:     profile?.phone     || latest.phone,
     notes: profile ? profile.notes || '' : '',
-    bookings,
+    birthDate: profile?.birthDate || '',
+    reason: profile?.reason || '',
+    contraindications: profile?.contraindications || '',
+    bookings: bookings.map(withSessionState),
   });
 }));
 
-// PUT /api/admin/clients/:email/profile — corrige prénom/nom/téléphone
+// PUT /api/admin/clients/:email/profile — identité et éléments de dossier
 app.put('/api/admin/clients/:email/profile', requireAuth, wrap(async (req, res) => {
   const email = req.params.email.toLowerCase();
-  const { firstName, lastName, phone } = req.body;
+  const { firstName, lastName, phone, birthDate, reason, contraindications } = req.body;
+
+  const shapeError = validateClientProfile(req.body || {});
+  if (shapeError) return res.status(400).json({ error: shapeError });
 
   const update = { updatedAt: new Date().toISOString() };
+  const unset = {};
+
+  // Identité : jamais effacée par mégarde — une chaîne vide est ignorée, car
+  // ces champs ont toujours une valeur de repli issue de la réservation.
   if (typeof firstName === 'string' && firstName.trim()) update.firstName = firstName.trim();
   if (typeof lastName === 'string' && lastName.trim())   update.lastName  = lastName.trim();
   if (typeof phone === 'string' && phone.trim())         update.phone    = phone.trim();
 
-  await db.collection('clients').updateOne(
-    { email },
-    { $set: update, $setOnInsert: { email } },
-    { upsert: true }
-  );
+  // Éléments de dossier : eux doivent pouvoir être effacés. Une contre-indication
+  // saisie par erreur et impossible à retirer serait pire que pas de champ du tout.
+  for (const [field, value] of Object.entries({ birthDate, reason, contraindications })) {
+    if (value === undefined) continue;
+    if (value === null || String(value).trim() === '') unset[field] = '';
+    else update[field] = String(value).trim();
+  }
+
+  const operations = { $set: update, $setOnInsert: { email } };
+  if (Object.keys(unset).length) operations.$unset = unset;
+
+  await db.collection('clients').updateOne({ email }, operations, { upsert: true });
   res.json({ success: true });
 }));
 
@@ -1258,6 +1478,8 @@ app.delete('/api/admin/clients/:email', requireAuth, wrap(async (req, res) => {
           phone: '',
           anonymisedAt: new Date().toISOString(),
         },
+        // Idem purge automatique : la note de suivi part avec l'identité.
+        $unset: { 'session.note': '' },
       }
     )).modifiedCount;
   }
@@ -1293,6 +1515,17 @@ app.put('/api/admin/notification-prefs', requireAuth, wrap(async (req, res) => {
 }));
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
+// GET /api/config — tarifs, durées et jours travaillés.
+// Publique : ces informations figurent déjà sur le site. Elle existe pour que
+// l'app iOS cesse de les redéclarer en dur de son côté.
+app.get('/api/config', (_, res) => res.json({
+  prices: SESSION_PRICES,
+  durations: SESSION_DURATIONS,
+  workingDays: WORKING_DAYS,
+  typeLabels: TYPE_LABELS,
+  paymentMethods: PAYMENT_METHODS,
+}));
+
 app.get('/api/health', (_, res) => res.json({
   status: 'ok',
   time: new Date().toISOString(),
