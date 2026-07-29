@@ -130,10 +130,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), wrap(
         throw e;
       }
 
-      sendPush(
-        'Bon cadeau vendu 🎁',
-        `${TYPE_LABELS[cert.type] || cert.type} — ${cert.amount} € pour ${cert.recipientName || cert.purchaserName}`
-      ).catch(e => console.error('Erreur envoi push bon cadeau :', e.message));
+      // Envoi de l'email en tâche de fond : Stripe abandonne le webhook au bout
+      // de quelques secondes, et le bon est déjà enregistré — inutile de faire
+      // attendre la réponse. `deliverGiftCertificate` consigne lui-même son
+      // résultat et alerte en cas d'échec.
+      deliverGiftCertificate(cert)
+        .catch(e => console.error('Erreur de remise du bon cadeau :', e.message));
     } catch (e) {
       // 500 = Stripe rejouera l'événement, ce qui est le comportement voulu pour
       // une panne transitoire (base indisponible).
@@ -474,6 +476,108 @@ async function sendPush(title, body) {
     .map(f => f.device);
   if (invalidTokens.length) {
     await db.collection('devices').deleteMany({ deviceToken: { $in: invalidTokens } });
+  }
+}
+
+// ── REMISE DU BON CADEAU PAR EMAIL ────────────────────────────────────────────
+// L'email part d'ici, et non du navigateur de l'acheteur comme auparavant :
+// c'est le seul point du parcours dont l'exécution est garantie après un
+// paiement réussi. Si l'acheteur ferme son onglet aussitôt payé, il reçoit
+// quand même son code.
+//
+// Passe par l'API REST d'EmailJS, déjà utilisée par le site pour les
+// confirmations de rendez-vous — pas de nouveau prestataire à gérer. Les appels
+// hors navigateur exigent la clé privée ET l'option « API for non-browser
+// applications » activée dans EmailJS (Account > Security).
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
+const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY;
+const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY;
+const EMAILJS_TEMPLATE_GIFT = process.env.EMAILJS_TEMPLATE_GIFT || 'template_cadeau';
+const emailConfigured = Boolean(EMAILJS_SERVICE_ID && EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY);
+
+function formatFrenchDate(iso) {
+  return new Intl.DateTimeFormat('fr-FR', {
+    timeZone: PARIS_TZ, day: 'numeric', month: 'long', year: 'numeric',
+  }).format(new Date(iso));
+}
+
+async function sendGiftEmail(cert) {
+  if (!emailConfigured) {
+    throw new Error('EmailJS non configuré (EMAILJS_SERVICE_ID / EMAILJS_PUBLIC_KEY / EMAILJS_PRIVATE_KEY manquants)');
+  }
+  if (!cert.purchaserEmail) {
+    throw new Error('Aucune adresse email pour cet acheteur');
+  }
+
+  // Sans délai maximal, un prestataire qui ne répond pas laisserait la promesse
+  // en suspens indéfiniment et le statut ne serait jamais consigné.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        service_id: EMAILJS_SERVICE_ID,
+        template_id: EMAILJS_TEMPLATE_GIFT,
+        user_id: EMAILJS_PUBLIC_KEY,
+        accessToken: EMAILJS_PRIVATE_KEY,
+        template_params: {
+          to_email:        cert.purchaserEmail,
+          to_name:         cert.purchaserName || '',
+          code:            cert.code,
+          type_seance:     TYPE_LABELS[cert.type] || cert.type,
+          montant:         `${cert.amount} €`,
+          recipient_name:  cert.recipientName || cert.purchaserName || '',
+          message:         cert.message || '',
+          date_expiration: formatFrenchDate(cert.expiresAt),
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const detail = (await response.text().catch(() => '')).slice(0, 200);
+      throw new Error(`EmailJS a répondu ${response.status}${detail ? ` — ${detail}` : ''}`);
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('EmailJS n\'a pas répondu dans les 15 secondes');
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/// Envoie le bon, consigne le résultat sur le document, et prévient Mathilde.
+///
+/// Un échec ne doit jamais rester silencieux : le client a payé. On enregistre
+/// donc l'erreur sur le bon (l'app affiche l'état et propose de réessayer) et on
+/// pousse une notification contenant le code, pour qu'elle puisse le transmettre
+/// à la main dans l'intervalle.
+async function deliverGiftCertificate(cert) {
+  try {
+    await sendGiftEmail(cert);
+    await db.collection('giftCertificates').updateOne(
+      { code: cert.code },
+      { $set: { emailSentAt: new Date().toISOString() }, $unset: { emailError: '' } }
+    );
+    sendPush(
+      'Bon cadeau vendu 🎁',
+      `${TYPE_LABELS[cert.type] || cert.type} — ${cert.amount} € pour ${cert.recipientName || cert.purchaserName}`
+    ).catch(e => console.error('Erreur envoi push bon cadeau :', e.message));
+    return true;
+  } catch (e) {
+    console.error(`Envoi du bon cadeau ${cert.code} à ${cert.purchaserEmail} en échec :`, e.message);
+    await db.collection('giftCertificates').updateOne(
+      { code: cert.code },
+      { $set: { emailError: e.message, emailErrorAt: new Date().toISOString() } }
+    ).catch(err => console.error('Impossible de consigner l\'échec d\'envoi :', err.message));
+    sendPush(
+      '⚠️ Bon cadeau à envoyer à la main',
+      `${cert.code} — ${cert.purchaserEmail} n'a PAS reçu son email. Ouvre l'app pour réessayer.`
+    ).catch(err => console.error('Erreur envoi push échec email :', err.message));
+    return false;
   }
 }
 
@@ -1314,6 +1418,41 @@ app.get('/api/admin/gift-certificates', requireAuth, wrap(async (req, res) => {
   res.json(certs);
 }));
 
+// POST /api/admin/gift-certificates/:code/resend-email — renvoi manuel depuis l'app,
+// après un échec d'envoi ou à la demande de l'acheteur (email perdu, adresse
+// mal saisie…).
+app.post('/api/admin/gift-certificates/:code/resend-email', requireAuth, wrap(async (req, res) => {
+  const code = String(req.params.code).trim().toUpperCase();
+  const cert = await db.collection('giftCertificates').findOne({ code }, NO_ID_PROJECTION);
+  if (!cert) return res.status(404).json({ error: 'Bon cadeau introuvable' });
+
+  // Permet de corriger une adresse erronée au passage.
+  const { email } = req.body || {};
+  if (email !== undefined) {
+    if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Email invalide' });
+    }
+    await db.collection('giftCertificates').updateOne({ code }, { $set: { purchaserEmail: email.trim().toLowerCase() } });
+    cert.purchaserEmail = email.trim().toLowerCase();
+  }
+
+  try {
+    await sendGiftEmail(cert);
+  } catch (e) {
+    await db.collection('giftCertificates').updateOne(
+      { code },
+      { $set: { emailError: e.message, emailErrorAt: new Date().toISOString() } }
+    );
+    return res.status(502).json({ error: `Envoi impossible : ${e.message}` });
+  }
+
+  await db.collection('giftCertificates').updateOne(
+    { code },
+    { $set: { emailSentAt: new Date().toISOString() }, $unset: { emailError: '' } }
+  );
+  res.json({ success: true, sentTo: cert.purchaserEmail });
+}));
+
 // POST /api/admin/gift-certificates/:code/redeem — usage manuel (code présenté en personne)
 app.post('/api/admin/gift-certificates/:code/redeem', requireAuth, wrap(async (req, res) => {
   const code = req.params.code.trim().toUpperCase();
@@ -1532,6 +1671,7 @@ app.get('/api/health', (_, res) => res.json({
   apnConfigured: apnProvider !== null,
   dbConnected: db !== null,
   stripeConfigured: stripe !== null,
+  emailConfigured,
 }));
 
 // ── MIDDLEWARE D'ERREUR ───────────────────────────────────────────────────────
