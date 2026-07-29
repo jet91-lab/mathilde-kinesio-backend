@@ -485,15 +485,22 @@ async function sendPush(title, body) {
 // paiement réussi. Si l'acheteur ferme son onglet aussitôt payé, il reçoit
 // quand même son code.
 //
-// Passe par l'API REST d'EmailJS, déjà utilisée par le site pour les
-// confirmations de rendez-vous — pas de nouveau prestataire à gérer. Les appels
-// hors navigateur exigent la clé privée ET l'option « API for non-browser
-// applications » activée dans EmailJS (Account > Security).
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID;
-const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY;
-const EMAILJS_PRIVATE_KEY = process.env.EMAILJS_PRIVATE_KEY;
-const EMAILJS_TEMPLATE_GIFT = process.env.EMAILJS_TEMPLATE_GIFT || 'template_cadeau';
-const emailConfigured = Boolean(EMAILJS_SERVICE_ID && EMAILJS_PUBLIC_KEY && EMAILJS_PRIVATE_KEY);
+// Passe par l'API transactionnelle de Brevo plutôt que par EmailJS, qui sert au
+// site pour les confirmations de rendez-vous. Deux raisons :
+//   • le palier gratuit d'EmailJS plafonne à 2 templates, tous deux déjà pris
+//     par les emails de réservation — un troisième imposait un abonnement ;
+//   • EmailJS est un relais de formulaire ; pour un reçu de paiement, un vrai
+//     transactionnel apporte des journaux de remise et la gestion des rebonds.
+// Brevo est français, ses serveurs sont dans l'UE, et son offre gratuite
+// (300 emails/jour) couvre très largement le besoin.
+//
+// Le contenu de l'email est composé ici plutôt que dans un template Brevo :
+// il est ainsi versionné avec le code, relisible en revue et testable. En
+// contrepartie, modifier le texte demande un déploiement.
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS;
+const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'À l\'équilibre';
+const emailConfigured = Boolean(BREVO_API_KEY && EMAIL_FROM_ADDRESS);
 
 function formatFrenchDate(iso) {
   return new Intl.DateTimeFormat('fr-FR', {
@@ -501,13 +508,103 @@ function formatFrenchDate(iso) {
   }).format(new Date(iso));
 }
 
+// Les noms et le message viennent du formulaire d'achat : à échapper avant
+// d'être insérés dans le HTML de l'email.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Libellés destinés au client. TYPE_LABELS reste volontairement court : il sert
+// aux notifications push et à l'app, où le ® n'apporte rien. Dans un email
+// commercial, en revanche, la marque s'écrit comme sur le site.
+const CUSTOMER_TYPE_LABELS = {
+  ...TYPE_LABELS,
+  aromatouch: 'AromaTouch®',
+};
+
+function giftEmailContent(cert) {
+  const typeLabel = CUSTOMER_TYPE_LABELS[cert.type] || cert.type;
+  const expiry = formatFrenchDate(cert.expiresAt);
+  const recipient = cert.recipientName || cert.purchaserName || '';
+  const greeting = cert.purchaserName ? `Bonjour ${cert.purchaserName},` : 'Bonjour,';
+
+  const subject = `Votre bon cadeau ${typeLabel} — ${cert.code}`;
+
+  // Version texte : indispensable pour la délivrabilité, et seule version lue
+  // par les clients qui bloquent le HTML.
+  const textContent = [
+    greeting,
+    '',
+    `Merci pour votre achat. Voici votre bon cadeau pour un soin ${typeLabel}.`,
+    '',
+    `CODE : ${cert.code}`,
+    `Montant : ${cert.amount} €`,
+    recipient ? `Pour : ${recipient}` : null,
+    `Valable jusqu'au ${expiry}`,
+    cert.message ? `\nVotre message : « ${cert.message} »` : null,
+    '',
+    'Pour en profiter, il suffit de réserver un créneau sur',
+    'https://mathilde-kinesio.fr/aromatouch-contact.html',
+    'et de présenter ce code le jour du soin.',
+    '',
+    'À bientôt,',
+    'Mathilde Bourgoin — À l\'équilibre',
+    '6 cours de la poste, 91760 Itteville',
+  ].filter(l => l !== null).join('\n');
+
+  const htmlContent = `<!doctype html>
+<html lang="fr"><body style="margin:0;padding:24px;background:#F5EFE6;font-family:Helvetica,Arial,sans-serif;color:#3B2F2F">
+  <div style="max-width:540px;margin:0 auto;background:#FDFAF6;border-radius:16px;padding:32px">
+    <p style="font-size:22px;margin:0 0 4px;color:#3D7A7A">À l'équilibre</p>
+    <p style="font-size:13px;color:#5A5A72;margin:0 0 24px">Mathilde Bourgoin · Itteville (91)</p>
+
+    <p style="margin:0 0 16px">${escapeHtml(greeting)}</p>
+    <p style="margin:0 0 24px">Merci pour votre achat. Voici votre bon cadeau pour un <strong>soin ${escapeHtml(typeLabel)}</strong>.</p>
+
+    <div style="background:linear-gradient(135deg,#E0F2F2,#EDE9F7);border:2px dashed #5B9E9E;border-radius:12px;padding:20px;text-align:center;margin:0 0 24px">
+      <div style="font-size:26px;font-weight:bold;letter-spacing:2px;color:#3D7A7A">${escapeHtml(cert.code)}</div>
+      <div style="font-size:12px;color:#5A5A72;margin-top:6px">à présenter le jour du soin</div>
+    </div>
+
+    <table style="width:100%;font-size:14px;border-collapse:collapse;margin:0 0 24px">
+      <tr><td style="padding:6px 0;color:#5A5A72">Séance</td><td style="text-align:right"><strong>${escapeHtml(typeLabel)}</strong></td></tr>
+      <tr><td style="padding:6px 0;color:#5A5A72">Montant</td><td style="text-align:right"><strong>${escapeHtml(String(cert.amount))} €</strong></td></tr>
+      ${recipient ? `<tr><td style="padding:6px 0;color:#5A5A72">Pour</td><td style="text-align:right"><strong>${escapeHtml(recipient)}</strong></td></tr>` : ''}
+      <tr><td style="padding:6px 0;color:#5A5A72">Valable jusqu'au</td><td style="text-align:right"><strong>${escapeHtml(expiry)}</strong></td></tr>
+    </table>
+
+    ${cert.message ? `<p style="background:#F5EFE6;border-radius:8px;padding:14px;font-style:italic;font-size:14px;margin:0 0 24px">« ${escapeHtml(cert.message)} »</p>` : ''}
+
+    <p style="margin:0 0 24px;font-size:14px">
+      Pour en profiter, il suffit de
+      <a href="https://mathilde-kinesio.fr/aromatouch-contact.html" style="color:#3D7A7A;font-weight:bold">réserver un créneau en ligne</a>
+      et de présenter ce code le jour du soin.
+    </p>
+
+    <p style="margin:0;font-size:14px">À bientôt,<br>Mathilde</p>
+    <p style="margin:20px 0 0;font-size:11px;color:#5A5A72;border-top:1px solid #E5DED2;padding-top:14px">
+      À l'équilibre · 6 cours de la poste, 91760 Itteville
+    </p>
+  </div>
+</body></html>`;
+
+  return { subject, textContent, htmlContent };
+}
+
 async function sendGiftEmail(cert) {
   if (!emailConfigured) {
-    throw new Error('EmailJS non configuré (EMAILJS_SERVICE_ID / EMAILJS_PUBLIC_KEY / EMAILJS_PRIVATE_KEY manquants)');
+    throw new Error('Envoi d\'email non configuré (BREVO_API_KEY / EMAIL_FROM_ADDRESS manquants)');
   }
   if (!cert.purchaserEmail) {
     throw new Error('Aucune adresse email pour cet acheteur');
   }
+
+  const { subject, textContent, htmlContent } = giftEmailContent(cert);
 
   // Sans délai maximal, un prestataire qui ne répond pas laisserait la promesse
   // en suspens indéfiniment et le statut ne serait jamais consigné.
@@ -515,34 +612,36 @@ async function sendGiftEmail(cert) {
   const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
-    const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'api-key': BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        accept: 'application/json',
+      },
       signal: controller.signal,
       body: JSON.stringify({
-        service_id: EMAILJS_SERVICE_ID,
-        template_id: EMAILJS_TEMPLATE_GIFT,
-        user_id: EMAILJS_PUBLIC_KEY,
-        accessToken: EMAILJS_PRIVATE_KEY,
-        template_params: {
-          to_email:        cert.purchaserEmail,
-          to_name:         cert.purchaserName || '',
-          code:            cert.code,
-          type_seance:     TYPE_LABELS[cert.type] || cert.type,
-          montant:         `${cert.amount} €`,
-          recipient_name:  cert.recipientName || cert.purchaserName || '',
-          message:         cert.message || '',
-          date_expiration: formatFrenchDate(cert.expiresAt),
-        },
+        sender: { name: EMAIL_FROM_NAME, email: EMAIL_FROM_ADDRESS },
+        to: [{ email: cert.purchaserEmail, name: cert.purchaserName || undefined }],
+        replyTo: { name: EMAIL_FROM_NAME, email: EMAIL_FROM_ADDRESS },
+        subject,
+        htmlContent,
+        textContent,
+        // Permet de retrouver l'email dans les journaux Brevo à partir du bon.
+        tags: ['bon-cadeau', cert.code],
       }),
     });
 
     if (!response.ok) {
       const detail = (await response.text().catch(() => '')).slice(0, 200);
-      throw new Error(`EmailJS a répondu ${response.status}${detail ? ` — ${detail}` : ''}`);
+      throw new Error(`Brevo a répondu ${response.status}${detail ? ` — ${detail}` : ''}`);
     }
+
+    // messageId permet de rapprocher un envoi d'une trace côté Brevo.
+    const body = await response.json().catch(() => ({}));
+    return body.messageId || null;
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('EmailJS n\'a pas répondu dans les 15 secondes');
+    if (e.name === 'AbortError') throw new Error('Brevo n\'a pas répondu dans les 15 secondes');
     throw e;
   } finally {
     clearTimeout(timeout);
@@ -557,10 +656,13 @@ async function sendGiftEmail(cert) {
 /// à la main dans l'intervalle.
 async function deliverGiftCertificate(cert) {
   try {
-    await sendGiftEmail(cert);
+    const messageId = await sendGiftEmail(cert);
     await db.collection('giftCertificates').updateOne(
       { code: cert.code },
-      { $set: { emailSentAt: new Date().toISOString() }, $unset: { emailError: '' } }
+      {
+        $set: { emailSentAt: new Date().toISOString(), emailMessageId: messageId },
+        $unset: { emailError: '' },
+      }
     );
     sendPush(
       'Bon cadeau vendu 🎁',
@@ -1436,8 +1538,9 @@ app.post('/api/admin/gift-certificates/:code/resend-email', requireAuth, wrap(as
     cert.purchaserEmail = email.trim().toLowerCase();
   }
 
+  let messageId;
   try {
-    await sendGiftEmail(cert);
+    messageId = await sendGiftEmail(cert);
   } catch (e) {
     await db.collection('giftCertificates').updateOne(
       { code },
@@ -1448,7 +1551,10 @@ app.post('/api/admin/gift-certificates/:code/resend-email', requireAuth, wrap(as
 
   await db.collection('giftCertificates').updateOne(
     { code },
-    { $set: { emailSentAt: new Date().toISOString() }, $unset: { emailError: '' } }
+    {
+      $set: { emailSentAt: new Date().toISOString(), emailMessageId: messageId },
+      $unset: { emailError: '' },
+    }
   );
   res.json({ success: true, sentTo: cert.purchaserEmail });
 }));
