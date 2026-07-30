@@ -989,12 +989,22 @@ app.get('/api/slots', wrap(async (req, res) => {
 // Vérifie qu'un créneau (date/startTime/endTime) est libre : ni réservé par une
 // autre réservation confirmée, ni bloqué. `excludeBookingId` permet à une
 // réservation d'ignorer son propre créneau lors d'une modification.
-async function checkSlotAvailable(date, startTime, endTime, type, excludeBookingId = null) {
-  const duration = SESSION_DURATIONS[type] || 60;
-  const allSlots = generateDaySlots(date, duration);
-  const slotExists = allSlots.some(s => s.start === startTime && s.end === endTime);
-  if (!slotExists) {
-    return 'Ce créneau n\'est pas disponible pour ce type de séance';
+//
+// `enforceGrid` restreint aux créneaux générés automatiquement (grille espacée
+// de GAP_MINUTES, alignée sur les horaires de travail) : c'est la contrainte
+// voulue pour la réservation publique, où le client ne doit choisir que parmi
+// des heures disponibles. Les routes admin passent `false` — Mathilde peut y
+// caser un rendez-vous à une heure quelconque (rattrapage, dépassement
+// d'horaires) — mais la vérification de conflit ci-dessous reste entière :
+// seule la contrainte de grille saute, jamais celle des doubles réservations.
+async function checkSlotAvailable(date, startTime, endTime, type, excludeBookingId = null, enforceGrid = true) {
+  if (enforceGrid) {
+    const duration = SESSION_DURATIONS[type] || 60;
+    const allSlots = generateDaySlots(date, duration);
+    const slotExists = allSlots.some(s => s.start === startTime && s.end === endTime);
+    if (!slotExists) {
+      return 'Ce créneau n\'est pas disponible pour ce type de séance';
+    }
   }
 
   const bookings = await db.collection('bookings').find({ date }, NO_ID_PROJECTION).toArray();
@@ -1187,8 +1197,17 @@ app.post('/api/admin/bookings', requireAuth, wrap(async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: 'Email invalide' });
   }
+  // Sans la contrainte de grille (voir enforceGrid=false ci-dessous), le format
+  // et l'ordre des horaires ne sont plus garantis par checkSlotAvailable — à
+  // valider explicitement ici.
+  if (!TIME_RE.test(startTime) || !TIME_RE.test(endTime)) {
+    return res.status(400).json({ error: 'Horaires invalides (HH:MM)' });
+  }
+  if (startTime >= endTime) {
+    return res.status(400).json({ error: 'L\'heure de fin doit suivre l\'heure de début' });
+  }
 
-  const conflictError = await checkSlotAvailable(date, startTime, endTime, type);
+  const conflictError = await checkSlotAvailable(date, startTime, endTime, type, null, false);
   if (conflictError) {
     return res.status(409).json({ error: conflictError });
   }
@@ -1320,8 +1339,14 @@ app.put('/api/admin/bookings/:id', requireAuth, wrap(async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: 'Email invalide' });
   }
+  if (!TIME_RE.test(startTime) || !TIME_RE.test(endTime)) {
+    return res.status(400).json({ error: 'Horaires invalides (HH:MM)' });
+  }
+  if (startTime >= endTime) {
+    return res.status(400).json({ error: 'L\'heure de fin doit suivre l\'heure de début' });
+  }
 
-  const conflictError = await checkSlotAvailable(date, startTime, endTime, type, existing.id);
+  const conflictError = await checkSlotAvailable(date, startTime, endTime, type, existing.id, false);
   if (conflictError) {
     return res.status(409).json({ error: conflictError });
   }
