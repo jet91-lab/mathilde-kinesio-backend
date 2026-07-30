@@ -18,8 +18,13 @@ app.set('trust proxy', 1);
 // interprété comme un opérateur. Aucune route n'a besoin de query imbriquée.
 app.set('query parser', 'simple');
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+// Pas de valeur par défaut : un JWT_SECRET ou un ADMIN_PASSWORD connu à
+// l'avance ouvrirait l'accès admin (fiches clients, données de santé) à
+// quiconque le devine. Leur absence est vérifiée dans start() avant que le
+// serveur n'accepte la moindre requête — voir plus bas, même logique que
+// pour MONGODB_URI.
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
@@ -1804,6 +1809,13 @@ process.on('uncaughtException', err => {
 async function start() {
   if (!MONGODB_URI) {
     console.error('MONGODB_URI manquant — impossible de démarrer sans base de données.');
+    process.exit(1);
+  }
+  if (!JWT_SECRET || !ADMIN_PASSWORD) {
+    console.error(
+      'JWT_SECRET et/ou ADMIN_PASSWORD manquant(s) — impossible de démarrer sans identifiants admin. ' +
+      'Une valeur par défaut connue à l\'avance donnerait accès aux fiches clients à quiconque la devine.'
+    );
     process.exit(1);
   }
 
