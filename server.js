@@ -830,7 +830,17 @@ async function checkDailyRecap() {
 
   const { day: today, time: currentTime } = parisNow();
 
-  if (currentTime !== prefs.dailyRecapTime || prefs.lastRecapSentDate === today) return;
+  // « L'heure est passée », et non « il est exactement cette minute-là ».
+  //
+  // Le service dort après quinze minutes d'inactivité (plan gratuit Render), et
+  // sa minuterie avec lui : exiger la minute exacte revient à exiger qu'il soit
+  // éveillé pile à 19:00, sans quoi le récap est perdu pour la journée, sans
+  // trace. Avec un rattrapage, le premier réveil venu après l'heure choisie
+  // suffit — qu'il vienne du ping quotidien ou d'une visite du site.
+  //
+  // Effet à connaître : un récap peut partir en retard. C'est très préférable
+  // à un récap qui ne part pas.
+  if (currentTime < prefs.dailyRecapTime || prefs.lastRecapSentDate === today) return;
 
   const tomorrowStr = nextDay(today);
 
