@@ -221,12 +221,67 @@ async function savePrefs(prefs) {
 
 // ── DISPONIBILITÉS DE BASE ────────────────────────────────────────────────────
 // 0=dim 1=lun 2=mar 3=mer 4=jeu 5=ven 6=sam
-const WORKING_DAYS = [1, 3, 5]; // lun, mer, ven
-const WORK_START = '09:00';
-const WORK_END   = '18:00';
-const LUNCH_START = '12:30';
-const LUNCH_END   = '14:00';
-const GAP_MINUTES = 15; // intervalle entre RDV
+//
+// Ces valeurs étaient figées dans le code : changer un jour d'ouverture
+// demandait un déploiement. Elles vivent maintenant en base, modifiables depuis
+// les Réglages de l'app — et comme le site public tire ses créneaux de la même
+// fonction, une modification s'y répercute aussitôt.
+const DEFAULT_SCHEDULE = {
+  workingDays: [1, 3, 5], // lun, mer, ven
+  workStart: '09:00',
+  workEnd: '18:00',
+  lunchEnabled: true,
+  lunchStart: '12:30',
+  lunchEnd: '14:00',
+  gapMinutes: 15,         // intervalle entre RDV
+};
+
+// Copie en mémoire : `generateDaySlots` est appelée en cascade dans le calcul
+// des disponibilités et doit rester synchrone. Le service ne tourne qu'en un
+// exemplaire (plan gratuit Render) ; une lecture au démarrage puis une mise à
+// jour à chaque enregistrement suffisent donc à garder cette copie fidèle.
+let schedule = { ...DEFAULT_SCHEDULE };
+
+async function loadSchedule() {
+  const doc = await db.collection('prefs').findOne({ _id: 'schedule' });
+  const { _id, ...stored } = doc || {};
+  schedule = { ...DEFAULT_SCHEDULE, ...stored };
+  return schedule;
+}
+
+function validateSchedule(body = {}) {
+  const isTime = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+
+  if (!Array.isArray(body.workingDays)) return 'Jours d\'ouverture invalides';
+  if (body.workingDays.some(d => !Number.isInteger(d) || d < 0 || d > 6)) {
+    return 'Jours d\'ouverture invalides';
+  }
+  if (!body.workingDays.length) return 'Au moins un jour d\'ouverture est nécessaire';
+
+  if (!isTime(body.workStart) || !isTime(body.workEnd)) return 'Horaires invalides';
+  if (timeToMinutes(body.workStart) >= timeToMinutes(body.workEnd)) {
+    return 'La fermeture doit suivre l\'ouverture';
+  }
+
+  if (body.lunchEnabled) {
+    if (!isTime(body.lunchStart) || !isTime(body.lunchEnd)) return 'Pause déjeuner invalide';
+    if (timeToMinutes(body.lunchStart) >= timeToMinutes(body.lunchEnd)) {
+      return 'La fin de la pause doit suivre son début';
+    }
+  }
+
+  if (!Number.isInteger(body.gapMinutes) || body.gapMinutes < 0 || body.gapMinutes > 60) {
+    return 'Intervalle entre rendez-vous invalide (0 à 60 minutes)';
+  }
+
+  // Sans ce garde-fou, on peut enregistrer une plage plus courte que la séance
+  // la plus courte : le calendrier se vide alors partout, sans rien signaler.
+  const shortest = Math.min(...Object.values(SESSION_DURATIONS));
+  if (timeToMinutes(body.workEnd) - timeToMinutes(body.workStart) < shortest) {
+    return `La plage d'ouverture doit durer au moins ${shortest} minutes`;
+  }
+  return null;
+}
 
 const SESSION_DURATIONS = {
   'decouverte':  60,  // 1h
@@ -404,23 +459,23 @@ function minutesToTime(mins) {
 function generateDaySlots(dateStr, durationMinutes) {
   const date = new Date(dateStr + 'T00:00:00');
   const dow = date.getDay();
-  if (!WORKING_DAYS.includes(dow)) return [];
+  if (!schedule.workingDays.includes(dow)) return [];
 
   const slots = [];
-  const start = timeToMinutes(WORK_START);
-  const end   = timeToMinutes(WORK_END);
-  const lStart = timeToMinutes(LUNCH_START);
-  const lEnd   = timeToMinutes(LUNCH_END);
+  const start = timeToMinutes(schedule.workStart);
+  const end   = timeToMinutes(schedule.workEnd);
+  const lStart = schedule.lunchEnabled ? timeToMinutes(schedule.lunchStart) : null;
+  const lEnd   = schedule.lunchEnabled ? timeToMinutes(schedule.lunchEnd) : null;
 
   let cur = start;
   while (cur + durationMinutes <= end) {
     const slotEnd = cur + durationMinutes;
     // Pas chevauchement avec pause déjeuner
-    const overlapsLunch = cur < lEnd && slotEnd > lStart;
+    const overlapsLunch = schedule.lunchEnabled && cur < lEnd && slotEnd > lStart;
     if (!overlapsLunch) {
       slots.push({ start: minutesToTime(cur), end: minutesToTime(slotEnd) });
     }
-    cur += durationMinutes + GAP_MINUTES;
+    cur += durationMinutes + schedule.gapMinutes;
   }
   return slots;
 }
@@ -1996,9 +2051,44 @@ app.put('/api/admin/notification-prefs', requireAuth, wrap(async (req, res) => {
 app.get('/api/config', (_, res) => res.json({
   prices: SESSION_PRICES,
   durations: SESSION_DURATIONS,
-  workingDays: WORKING_DAYS,
+  workingDays: schedule.workingDays,
+  schedule,
   typeLabels: TYPE_LABELS,
   paymentMethods: PAYMENT_METHODS,
+}));
+
+// ── HORAIRES D'OUVERTURE ──────────────────────────────────────────────────────
+
+// GET /api/admin/schedule
+app.get('/api/admin/schedule', requireAuth, wrap(async (_, res) => {
+  res.json(await loadSchedule());
+}));
+
+// PUT /api/admin/schedule
+//
+// Ne touche pas aux rendez-vous déjà pris : fermer le mercredi ne les annule
+// pas, il cesse seulement d'en proposer de nouveaux. Les rendez-vous qui
+// tombent désormais hors plage restent visibles dans le planning.
+app.put('/api/admin/schedule', requireAuth, wrap(async (req, res) => {
+  const error = validateSchedule(req.body);
+  if (error) return res.status(400).json({ error });
+
+  const updated = {
+    workingDays: [...new Set(req.body.workingDays)].sort((a, b) => a - b),
+    workStart: req.body.workStart,
+    workEnd: req.body.workEnd,
+    lunchEnabled: Boolean(req.body.lunchEnabled),
+    lunchStart: req.body.lunchStart || DEFAULT_SCHEDULE.lunchStart,
+    lunchEnd: req.body.lunchEnd || DEFAULT_SCHEDULE.lunchEnd,
+    gapMinutes: req.body.gapMinutes,
+  };
+
+  await db.collection('prefs').updateOne(
+    { _id: 'schedule' },
+    { $set: updated },
+    { upsert: true }
+  );
+  res.json(await loadSchedule());
 }));
 
 app.get('/api/health', (_, res) => res.json({
@@ -2060,6 +2150,10 @@ async function start() {
   await db.collection('giftCertificates').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
   await db.collection('socialPosts').createIndex({ id: 1 }, { unique: true });
   await db.collection('socialPosts').createIndex({ status: 1, date: 1 });
+
+  // Les horaires d'ouverture sont lus une fois ici : `generateDaySlots` est
+  // synchrone et les consulte à chaque calcul de disponibilité.
+  await loadSchedule();
 
   // Garde-fou anti-double-réservation : deux requêtes simultanées sur le même
   // créneau passent toutes les deux checkSlotAvailable(), qui n'est pas atomique.
