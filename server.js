@@ -428,7 +428,8 @@ function generateDaySlots(dateStr, durationMinutes) {
 // ── NOTIFICATIONS PUSH (APNs) ─────────────────────────────────────────────────
 // Config à définir dans les variables d'env Render une fois la clé APNs générée
 // depuis le compte développeur Apple : APN_KEY (contenu du .p8, ou APN_KEY_PATH
-// vers un fichier), APN_KEY_ID, APN_TEAM_ID, APN_BUNDLE_ID, APN_PRODUCTION=true.
+// vers un fichier), APN_KEY_ID, APN_TEAM_ID, APN_BUNDLE_ID. `APN_PRODUCTION`
+// n'est plus un interrupteur : voir le commentaire des fournisseurs plus bas.
 //
 // node-apn traite toute valeur `string` passée à `token.key` comme un CHEMIN
 // DE FICHIER (fs.readFileSync dessus) — jamais comme le contenu brut de la
@@ -443,28 +444,47 @@ function resolveAPNKey() {
   return Buffer.from(normalized, 'utf8');
 }
 
-let apnProvider = null;
+// Les deux environnements APNs coexistent en permanence : l'app lancée depuis
+// Xcode reçoit un jeton `development`, la même app installée par TestFlight un
+// jeton `production`. Un jeton présenté au mauvais environnement échoue avec
+// `BadDeviceToken` — motif que ce serveur interprétait comme une désinstallation
+// et qui faisait donc *supprimer* l'appareil. Avec un fournisseur unique, une
+// simple relance depuis Xcode détruisait l'enregistrement TestFlight.
+//
+// D'où deux fournisseurs, et un routage sur l'environnement enregistré avec
+// chaque jeton. `APN_PRODUCTION` ne commande plus rien : elle ne sert qu'à
+// deviner l'environnement des jetons enregistrés avant cette version.
+const apnProviders = {};
 const apnKey = resolveAPNKey();
 if (process.env.APN_KEY_ID && process.env.APN_TEAM_ID && apnKey) {
-  try {
-    apnProvider = new apn.Provider({
-      token: {
-        key: apnKey,
-        keyId: process.env.APN_KEY_ID,
-        teamId: process.env.APN_TEAM_ID,
-      },
-      production: process.env.APN_PRODUCTION === 'true',
-    });
-    console.log('APNs configuré.');
-  } catch (e) {
-    console.error('Erreur de configuration APNs :', e.message);
+  const credentials = {
+    key: apnKey,
+    keyId: process.env.APN_KEY_ID,
+    teamId: process.env.APN_TEAM_ID,
+  };
+  for (const environment of ['development', 'production']) {
+    try {
+      apnProviders[environment] = new apn.Provider({
+        token: credentials,
+        production: environment === 'production',
+      });
+    } catch (e) {
+      console.error(`Erreur de configuration APNs (${environment}) :`, e.message);
+    }
   }
+  console.log(`APNs configuré : ${Object.keys(apnProviders).join(', ')}.`);
 } else {
   console.log('APNs non configuré (variables d\'env manquantes) — notifications push désactivées.');
 }
 
+const apnConfigured = () => Object.keys(apnProviders).length > 0;
+
+// Environnement supposé des jetons enregistrés avant que l'app ne le transmette.
+const LEGACY_APN_ENVIRONMENT =
+  process.env.APN_PRODUCTION === 'true' ? 'production' : 'development';
+
 async function sendPush(title, body) {
-  if (!apnProvider) return;
+  if (!apnConfigured()) return;
   const devices = await db.collection('devices').find({}, NO_ID_PROJECTION).toArray();
   if (!devices.length) return;
 
@@ -473,14 +493,43 @@ async function sendPush(title, body) {
   note.sound = 'default';
   note.topic = process.env.APN_BUNDLE_ID;
 
-  const result = await apnProvider.send(note, devices.map(d => d.deviceToken));
+  for (const [environment, provider] of Object.entries(apnProviders)) {
+    const batch = devices.filter(
+      d => (d.environment || LEGACY_APN_ENVIRONMENT) === environment
+    );
+    if (!batch.length) continue;
 
-  // Purge les tokens invalides (désinstallation, expiration…)
-  const invalidTokens = result.failed
-    .filter(f => ['BadDeviceToken', 'Unregistered'].includes(f.response?.reason))
-    .map(f => f.device);
-  if (invalidTokens.length) {
-    await db.collection('devices').deleteMany({ deviceToken: { $in: invalidTokens } });
+    const result = await provider.send(note, batch.map(d => d.deviceToken));
+    const failedFor = reason =>
+      result.failed.filter(f => f.response?.reason === reason).map(f => f.device);
+
+    // `Unregistered` = l'app a été désinstallée : le jeton ne reviendra pas.
+    const unregistered = failedFor('Unregistered');
+    if (unregistered.length) {
+      await db.collection('devices').deleteMany({ deviceToken: { $in: unregistered } });
+    }
+
+    // `BadDeviceToken` = mauvais environnement, ou jeton réellement invalide.
+    // On ne supprime que si l'app avait elle-même déclaré son environnement :
+    // l'erreur est alors sans appel. Pour un jeton dont l'environnement n'a été
+    // que supposé, on bascule la supposition au lieu de détruire l'appareil —
+    // le prochain envoi passera par l'autre fournisseur.
+    const bad = failedFor('BadDeviceToken');
+    if (bad.length) {
+      const declared = new Set(devices.filter(d => d.environment).map(d => d.deviceToken));
+      const toDelete = bad.filter(t => declared.has(t));
+      const toFlip = bad.filter(t => !declared.has(t));
+      if (toDelete.length) {
+        await db.collection('devices').deleteMany({ deviceToken: { $in: toDelete } });
+      }
+      if (toFlip.length) {
+        const other = environment === 'production' ? 'development' : 'production';
+        await db.collection('devices').updateMany(
+          { deviceToken: { $in: toFlip } },
+          { $set: { environment: other, environmentGuessed: true } }
+        );
+      }
+    }
   }
 }
 
@@ -1441,17 +1490,168 @@ app.delete('/api/admin/blocks/:id', requireAuth, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
+// ── PLANNING DE COMMUNICATION ─────────────────────────────────────────────────
+// Publications Instagram : ce qui est prévu, ce qui est déjà paru, et la réserve
+// d'idées pas encore datées. Le serveur ne publie rien et ne déclenche aucun
+// rappel : c'est l'app qui pose des notifications locales sur l'iPhone. Un
+// service qui s'endort au bout de 15 minutes (plan gratuit Render) ne peut pas
+// tenir une promesse d'envoi à 18 h — voir C1b de l'audit iOS.
+
+const SOCIAL_STATUSES = ['idea', 'planned', 'published'];
+const SOCIAL_FORMATS = ['post', 'story'];
+const SOCIAL_RECURRENCES = ['none', 'monthly', 'yearly'];
+
+function validateSocialPost({ title, status, format, date, time, recurrence } = {}) {
+  if (typeof title !== 'string' || !title.trim()) return 'Titre requis';
+  if (!SOCIAL_STATUSES.includes(status)) return 'Statut invalide';
+  if (!SOCIAL_FORMATS.includes(format)) return 'Format invalide';
+  if (recurrence !== undefined && !SOCIAL_RECURRENCES.includes(recurrence)) {
+    return 'Récurrence invalide';
+  }
+  // Une idée n'a pas de date : c'est précisément ce qui la distingue d'une
+  // publication prévue, et ce qui la fait apparaître dans la réserve.
+  if (status === 'idea') return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return 'Date requise (AAAA-MM-JJ)';
+  if (!/^\d{2}:\d{2}$/.test(time || '')) return 'Heure requise (HH:MM)';
+  return null;
+}
+
+/// Même quantième le mois (ou l'an) suivant, ramené au dernier jour du mois
+/// quand il n'existe pas : le 31 janvier en mensuel donne le 28 février, pas
+/// le 3 mars. Comme `nextDay`, le calcul passe par midi UTC.
+function shiftDate(dayStr, { months = 0, years = 0 }) {
+  const [y, m, d] = dayStr.split('-').map(Number);
+  const target = new Date(Date.UTC(y + years, m - 1 + months, 1, 12));
+  const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0, 12)).getUTCDate();
+  target.setUTCDate(Math.min(d, lastDay));
+  return target.toISOString().slice(0, 10);
+}
+
+function socialPostFrom(body) {
+  const status = SOCIAL_STATUSES.includes(body.status) ? body.status : 'planned';
+  return {
+    status,
+    title: String(body.title).trim(),
+    caption: typeof body.caption === 'string' ? body.caption : '',
+    hashtags: typeof body.hashtags === 'string' ? body.hashtags : '',
+    format: body.format,
+    assetName: typeof body.assetName === 'string' && body.assetName ? body.assetName : null,
+    date: status === 'idea' ? null : body.date,
+    time: status === 'idea' ? null : body.time,
+    recurrence: SOCIAL_RECURRENCES.includes(body.recurrence) ? body.recurrence : 'none',
+  };
+}
+
+// GET /api/admin/social-posts
+app.get('/api/admin/social-posts', requireAuth, wrap(async (req, res) => {
+  const filter = SOCIAL_STATUSES.includes(req.query.status) ? { status: req.query.status } : {};
+  const posts = await db.collection('socialPosts').find(filter, NO_ID_PROJECTION).toArray();
+  // Les idées n'ont pas de date : elles ferment la liste, les plus récentes
+  // d'abord, pour rester à portée de main sans polluer le calendrier.
+  posts.sort((a, b) => {
+    if (!a.date && !b.date) return (b.createdAt || '').localeCompare(a.createdAt || '');
+    if (!a.date) return 1;
+    if (!b.date) return -1;
+    return `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`);
+  });
+  res.json(posts);
+}));
+
+// POST /api/admin/social-posts
+app.post('/api/admin/social-posts', requireAuth, wrap(async (req, res) => {
+  const error = validateSocialPost(req.body);
+  if (error) return res.status(400).json({ error });
+
+  const post = {
+    id: uuidv4(),
+    ...socialPostFrom(req.body),
+    publishedAt: null,
+    createdAt: new Date().toISOString(),
+  };
+  await db.collection('socialPosts').insertOne({ ...post });
+  res.status(201).json(post);
+}));
+
+// PUT /api/admin/social-posts/:id
+app.put('/api/admin/social-posts/:id', requireAuth, wrap(async (req, res) => {
+  const error = validateSocialPost(req.body);
+  if (error) return res.status(400).json({ error });
+
+  const updated = { ...socialPostFrom(req.body), updatedAt: new Date().toISOString() };
+  const result = await db.collection('socialPosts').findOneAndUpdate(
+    { id: req.params.id },
+    { $set: updated },
+    { returnDocument: 'after', projection: { _id: 0 } }
+  );
+  if (!result) return res.status(404).json({ error: 'Publication introuvable' });
+  res.json(result);
+}));
+
+// POST /api/admin/social-posts/:id/publish — marquer comme parue
+//
+// La récurrence est engendrée ici, au moment où la publication est cochée,
+// plutôt que par une minuterie qui ne tournerait pas : le rendez-vous suivant
+// naît du geste précédent. Une occurrence oubliée n'engendre donc pas de suite,
+// ce qui est le comportement voulu — mieux vaut un rappel manquant qu'un
+// calendrier qui se remplit tout seul de publications jamais faites.
+app.post('/api/admin/social-posts/:id/publish', requireAuth, wrap(async (req, res) => {
+  const post = await db.collection('socialPosts').findOne({ id: req.params.id }, NO_ID_PROJECTION);
+  if (!post) return res.status(404).json({ error: 'Publication introuvable' });
+
+  const publishedAt = new Date().toISOString();
+  await db.collection('socialPosts').updateOne(
+    { id: post.id },
+    { $set: { status: 'published', publishedAt } }
+  );
+
+  let next = null;
+  if (post.recurrence === 'monthly' || post.recurrence === 'yearly') {
+    const shift = post.recurrence === 'monthly' ? { months: 1 } : { years: 1 };
+    next = {
+      ...post,
+      id: uuidv4(),
+      status: 'planned',
+      date: shiftDate(post.date, shift),
+      publishedAt: null,
+      createdAt: publishedAt,
+    };
+    await db.collection('socialPosts').insertOne({ ...next });
+  }
+
+  res.json({ published: { ...post, status: 'published', publishedAt }, next });
+}));
+
+// DELETE /api/admin/social-posts/:id
+app.delete('/api/admin/social-posts/:id', requireAuth, wrap(async (req, res) => {
+  const result = await db.collection('socialPosts').deleteOne({ id: req.params.id });
+  if (result.deletedCount === 0) return res.status(404).json({ error: 'Publication introuvable' });
+  res.json({ success: true });
+}));
+
 // ── APPAREILS (notifications push) ─────────────────────────────────────────────
 
 // POST /api/admin/device-token
 app.post('/api/admin/device-token', requireAuth, wrap(async (req, res) => {
-  const { deviceToken, platform, label } = req.body;
+  const { deviceToken, platform, label, environment } = req.body;
   if (!deviceToken) return res.status(400).json({ error: 'deviceToken requis' });
+
+  // L'environnement APNs conditionne le fournisseur par lequel ce jeton doit
+  // partir (cf. sendPush). Une valeur inconnue est ignorée plutôt que stockée :
+  // mieux vaut la supposition héritée qu'une donnée fausse mais « déclarée »,
+  // qui autoriserait la suppression de l'appareil au premier échec.
+  const declaredEnvironment =
+    ['development', 'production'].includes(environment) ? environment : null;
 
   await db.collection('devices').updateOne(
     { deviceToken },
     {
-      $set: { platform: platform || 'ios', label: label || '' },
+      $set: {
+        platform: platform || 'ios',
+        label: label || '',
+        ...(declaredEnvironment
+          ? { environment: declaredEnvironment, environmentGuessed: false }
+          : {}),
+      },
       $setOnInsert: { deviceToken, registeredAt: new Date().toISOString() },
     },
     { upsert: true }
@@ -1804,7 +2004,8 @@ app.get('/api/config', (_, res) => res.json({
 app.get('/api/health', (_, res) => res.json({
   status: 'ok',
   time: new Date().toISOString(),
-  apnConfigured: apnProvider !== null,
+  apnConfigured: apnConfigured(),
+  apnEnvironments: Object.keys(apnProviders),
   dbConnected: db !== null,
   stripeConfigured: stripe !== null,
   emailConfigured,
@@ -1857,6 +2058,8 @@ async function start() {
   await db.collection('devices').createIndex({ deviceToken: 1 }, { unique: true });
   await db.collection('giftCertificates').createIndex({ code: 1 }, { unique: true });
   await db.collection('giftCertificates').createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
+  await db.collection('socialPosts').createIndex({ id: 1 }, { unique: true });
+  await db.collection('socialPosts').createIndex({ status: 1, date: 1 });
 
   // Garde-fou anti-double-réservation : deux requêtes simultanées sur le même
   // créneau passent toutes les deux checkSlotAvailable(), qui n'est pas atomique.
