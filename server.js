@@ -226,61 +226,179 @@ async function savePrefs(prefs) {
 // demandait un déploiement. Elles vivent maintenant en base, modifiables depuis
 // les Réglages de l'app — et comme le site public tire ses créneaux de la même
 // fonction, une modification s'y répercute aussitôt.
+//
+// Chaque jour a sa propre plage (`days`, indexé par jour de la semaine). Un
+// jour fermé garde ses heures : le rouvrir retrouve la plage qu'il avait. La
+// pause déjeuner et l'intervalle entre séances restent communs à la semaine.
+const DEFAULT_DAY_START = '09:00';
+const DEFAULT_DAY_END = '18:00';
+
 const DEFAULT_SCHEDULE = {
-  workingDays: [1, 3, 5], // lun, mer, ven
-  workStart: '09:00',
-  workEnd: '18:00',
+  days: [0, 1, 2, 3, 4, 5, 6].map(d => ({
+    open: [1, 3, 5].includes(d), // lun, mer, ven
+    start: DEFAULT_DAY_START,
+    end: DEFAULT_DAY_END,
+  })),
   lunchEnabled: true,
   lunchStart: '12:30',
   lunchEnd: '14:00',
   gapMinutes: 15,         // intervalle entre RDV
 };
 
+const DAY_NAMES = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+const isTimeString = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+
 // Copie en mémoire : `generateDaySlots` est appelée en cascade dans le calcul
 // des disponibilités et doit rester synchrone. Le service ne tourne qu'en un
 // exemplaire (plan gratuit Render) ; une lecture au démarrage puis une mise à
 // jour à chaque enregistrement suffisent donc à garder cette copie fidèle.
-let schedule = { ...DEFAULT_SCHEDULE };
+let schedule = structuredClone(DEFAULT_SCHEDULE);
+
+function workingDaysOf(sched) {
+  return sched.days.flatMap((day, dow) => (day.open ? [dow] : []));
+}
+
+// Forme exposée par l'API. Aux champs par jour s'ajoutent `workingDays`,
+// `workStart` et `workEnd`, que lisent les versions de l'app antérieures à
+// l'horaire par jour — sans eux, elles échoueraient à décoder la réponse. Pour
+// elles, la plage résumée va de la plus tôt des ouvertures à la plus tardive
+// des fermetures.
+function publicSchedule(sched) {
+  const open = sched.days.filter(day => day.open);
+  const earliest = open.map(day => day.start).sort()[0] || DEFAULT_DAY_START;
+  const latest = open.map(day => day.end).sort().pop() || DEFAULT_DAY_END;
+  return {
+    days: sched.days,
+    workingDays: workingDaysOf(sched),
+    workStart: earliest,
+    workEnd: latest,
+    lunchEnabled: sched.lunchEnabled,
+    lunchStart: sched.lunchStart,
+    lunchEnd: sched.lunchEnd,
+    gapMinutes: sched.gapMinutes,
+  };
+}
+
+// Traduit l'ancien format (une plage commune à tous les jours ouverts) en
+// plages par jour. Sert à relire un document enregistré avant l'horaire par
+// jour, et à accepter l'enregistrement d'une app pas encore mise à jour.
+function daysFromUniformRange(workingDays, start, end) {
+  return [0, 1, 2, 3, 4, 5, 6].map(d => ({
+    open: workingDays.includes(d),
+    start,
+    end,
+  }));
+}
 
 async function loadSchedule() {
   const doc = await db.collection('prefs').findOne({ _id: 'schedule' });
-  const { _id, ...stored } = doc || {};
-  schedule = { ...DEFAULT_SCHEDULE, ...stored };
+  const { _id, days, workingDays, workStart, workEnd, ...common } = doc || {};
+  const storedDays = Array.isArray(days) && days.length === 7
+    ? days
+    : Array.isArray(workingDays)
+      ? daysFromUniformRange(workingDays, workStart || DEFAULT_DAY_START, workEnd || DEFAULT_DAY_END)
+      : DEFAULT_SCHEDULE.days;
+  schedule = { ...structuredClone(DEFAULT_SCHEDULE), ...common, days: storedDays };
   return schedule;
 }
 
-function validateSchedule(body = {}) {
-  const isTime = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+// Liste des créneaux d'une journée aux horaires `day`, avec la pause et
+// l'intervalle de `sched`. Pure : sert au calcul des disponibilités comme à la
+// validation d'un horaire avant de l'enregistrer.
+function slotsForDay(day, sched, durationMinutes) {
+  if (!day || !day.open) return [];
 
-  if (!Array.isArray(body.workingDays)) return 'Jours d\'ouverture invalides';
-  if (body.workingDays.some(d => !Number.isInteger(d) || d < 0 || d > 6)) {
-    return 'Jours d\'ouverture invalides';
-  }
-  if (!body.workingDays.length) return 'Au moins un jour d\'ouverture est nécessaire';
+  const slots = [];
+  const start = timeToMinutes(day.start);
+  const end   = timeToMinutes(day.end);
+  const lStart = sched.lunchEnabled ? timeToMinutes(sched.lunchStart) : null;
+  const lEnd   = sched.lunchEnabled ? timeToMinutes(sched.lunchEnd) : null;
 
-  if (!isTime(body.workStart) || !isTime(body.workEnd)) return 'Horaires invalides';
-  if (timeToMinutes(body.workStart) >= timeToMinutes(body.workEnd)) {
-    return 'La fermeture doit suivre l\'ouverture';
+  let cur = start;
+  while (cur + durationMinutes <= end) {
+    const slotEnd = cur + durationMinutes;
+    // Pas chevauchement avec pause déjeuner
+    const overlapsLunch = sched.lunchEnabled && cur < lEnd && slotEnd > lStart;
+    if (!overlapsLunch) {
+      slots.push({ start: minutesToTime(cur), end: minutesToTime(slotEnd) });
+    }
+    cur += durationMinutes + sched.gapMinutes;
   }
+  return slots;
+}
+
+// Valide le corps d'un PUT /api/admin/schedule et le ramène à la forme
+// stockée. Renvoie `{ error }` ou `{ schedule }`.
+//
+// Deux formats sont acceptés : `days` (une plage par jour) et l'ancien
+// `workingDays` + `workStart`/`workEnd`, envoyé par les versions de l'app
+// antérieures à l'horaire par jour. Ce dernier garde son sens d'origine : la
+// même plage pour tous les jours ouverts — c'est ce que son écran affiche.
+function scheduleFromBody(body = {}) {
+  let days;
+  if (Array.isArray(body.days)) {
+    if (body.days.length !== 7) return { error: 'Horaires invalides : sept jours attendus' };
+    days = body.days.map(day => ({
+      open: Boolean(day && day.open),
+      start: day && day.start,
+      end: day && day.end,
+    }));
+  } else {
+    if (!Array.isArray(body.workingDays)) return { error: 'Jours d\'ouverture invalides' };
+    if (body.workingDays.some(d => !Number.isInteger(d) || d < 0 || d > 6)) {
+      return { error: 'Jours d\'ouverture invalides' };
+    }
+    if (!isTimeString(body.workStart) || !isTimeString(body.workEnd)) return { error: 'Horaires invalides' };
+    days = daysFromUniformRange(body.workingDays, body.workStart, body.workEnd);
+  }
+
+  if (!days.some(day => day.open)) return { error: 'Au moins un jour d\'ouverture est nécessaire' };
 
   if (body.lunchEnabled) {
-    if (!isTime(body.lunchStart) || !isTime(body.lunchEnd)) return 'Pause déjeuner invalide';
+    if (!isTimeString(body.lunchStart) || !isTimeString(body.lunchEnd)) return { error: 'Pause déjeuner invalide' };
     if (timeToMinutes(body.lunchStart) >= timeToMinutes(body.lunchEnd)) {
-      return 'La fin de la pause doit suivre son début';
+      return { error: 'La fin de la pause doit suivre son début' };
     }
   }
 
   if (!Number.isInteger(body.gapMinutes) || body.gapMinutes < 0 || body.gapMinutes > 60) {
-    return 'Intervalle entre rendez-vous invalide (0 à 60 minutes)';
+    return { error: 'Intervalle entre rendez-vous invalide (0 à 60 minutes)' };
   }
 
-  // Sans ce garde-fou, on peut enregistrer une plage plus courte que la séance
-  // la plus courte : le calendrier se vide alors partout, sans rien signaler.
+  const sched = {
+    days,
+    lunchEnabled: Boolean(body.lunchEnabled),
+    lunchStart: body.lunchStart || DEFAULT_SCHEDULE.lunchStart,
+    lunchEnd: body.lunchEnd || DEFAULT_SCHEDULE.lunchEnd,
+    gapMinutes: body.gapMinutes,
+  };
+
   const shortest = Math.min(...Object.values(SESSION_DURATIONS));
-  if (timeToMinutes(body.workEnd) - timeToMinutes(body.workStart) < shortest) {
-    return `La plage d'ouverture doit durer au moins ${shortest} minutes`;
+  for (const [dow, day] of days.entries()) {
+    const validTimes = isTimeString(day.start) && isTimeString(day.end);
+    if (!day.open) {
+      // Un jour fermé n'engendre aucun créneau : ses heures ne sont qu'un
+      // souvenir pour sa réouverture. Illisibles, on les remplace plutôt que de
+      // bloquer l'enregistrement pour un jour qui ne sert pas.
+      if (!validTimes || timeToMinutes(day.start) >= timeToMinutes(day.end)) {
+        day.start = DEFAULT_DAY_START;
+        day.end = DEFAULT_DAY_END;
+      }
+      continue;
+    }
+    if (!validTimes) return { error: `${DAY_NAMES[dow]} : horaires invalides` };
+    if (timeToMinutes(day.start) >= timeToMinutes(day.end)) {
+      return { error: `${DAY_NAMES[dow]} : la fermeture doit suivre l'ouverture` };
+    }
+    // Sans ce garde-fou, on peut ouvrir un jour sur une plage où aucune séance
+    // ne tient (trop courte, ou mangée par la pause) : il reste alors grisé sur
+    // le site, sans que rien ne le signale.
+    if (slotsForDay(day, sched, shortest).length === 0) {
+      return { error: `${DAY_NAMES[dow]} : aucune séance de ${shortest} minutes ne tient dans cette plage` };
+    }
   }
-  return null;
+
+  return { schedule: sched };
 }
 
 const SESSION_DURATIONS = {
@@ -457,27 +575,8 @@ function minutesToTime(mins) {
 
 // Retourne tous les créneaux potentiels d'une journée (sans tenir compte des blocages)
 function generateDaySlots(dateStr, durationMinutes) {
-  const date = new Date(dateStr + 'T00:00:00');
-  const dow = date.getDay();
-  if (!schedule.workingDays.includes(dow)) return [];
-
-  const slots = [];
-  const start = timeToMinutes(schedule.workStart);
-  const end   = timeToMinutes(schedule.workEnd);
-  const lStart = schedule.lunchEnabled ? timeToMinutes(schedule.lunchStart) : null;
-  const lEnd   = schedule.lunchEnabled ? timeToMinutes(schedule.lunchEnd) : null;
-
-  let cur = start;
-  while (cur + durationMinutes <= end) {
-    const slotEnd = cur + durationMinutes;
-    // Pas chevauchement avec pause déjeuner
-    const overlapsLunch = schedule.lunchEnabled && cur < lEnd && slotEnd > lStart;
-    if (!overlapsLunch) {
-      slots.push({ start: minutesToTime(cur), end: minutesToTime(slotEnd) });
-    }
-    cur += durationMinutes + schedule.gapMinutes;
-  }
-  return slots;
+  const dow = new Date(dateStr + 'T00:00:00').getDay();
+  return slotsForDay(schedule.days[dow], schedule, durationMinutes);
 }
 
 // ── NOTIFICATIONS PUSH (APNs) ─────────────────────────────────────────────────
@@ -2061,8 +2160,8 @@ app.put('/api/admin/notification-prefs', requireAuth, wrap(async (req, res) => {
 app.get('/api/config', (_, res) => res.json({
   prices: SESSION_PRICES,
   durations: SESSION_DURATIONS,
-  workingDays: schedule.workingDays,
-  schedule,
+  workingDays: workingDaysOf(schedule),
+  schedule: publicSchedule(schedule),
   typeLabels: TYPE_LABELS,
   paymentMethods: PAYMENT_METHODS,
 }));
@@ -2071,7 +2170,7 @@ app.get('/api/config', (_, res) => res.json({
 
 // GET /api/admin/schedule
 app.get('/api/admin/schedule', requireAuth, wrap(async (_, res) => {
-  res.json(await loadSchedule());
+  res.json(publicSchedule(await loadSchedule()));
 }));
 
 // PUT /api/admin/schedule
@@ -2080,25 +2179,19 @@ app.get('/api/admin/schedule', requireAuth, wrap(async (_, res) => {
 // pas, il cesse seulement d'en proposer de nouveaux. Les rendez-vous qui
 // tombent désormais hors plage restent visibles dans le planning.
 app.put('/api/admin/schedule', requireAuth, wrap(async (req, res) => {
-  const error = validateSchedule(req.body);
+  const { error, schedule: updated } = scheduleFromBody(req.body);
   if (error) return res.status(400).json({ error });
 
-  const updated = {
-    workingDays: [...new Set(req.body.workingDays)].sort((a, b) => a - b),
-    workStart: req.body.workStart,
-    workEnd: req.body.workEnd,
-    lunchEnabled: Boolean(req.body.lunchEnabled),
-    lunchStart: req.body.lunchStart || DEFAULT_SCHEDULE.lunchStart,
-    lunchEnd: req.body.lunchEnd || DEFAULT_SCHEDULE.lunchEnd,
-    gapMinutes: req.body.gapMinutes,
-  };
-
+  // Les champs de l'ancien format sont réécrits à côté de `days` : si le
+  // serveur devait revenir à une version antérieure, il relirait une plage
+  // approchante plutôt que de retomber en silence sur les horaires par défaut.
+  const { workingDays, workStart, workEnd } = publicSchedule(updated);
   await db.collection('prefs').updateOne(
     { _id: 'schedule' },
-    { $set: updated },
+    { $set: { ...updated, workingDays, workStart, workEnd } },
     { upsert: true }
   );
-  res.json(await loadSchedule());
+  res.json(publicSchedule(await loadSchedule()));
 }));
 
 app.get('/api/health', (_, res) => res.json({
