@@ -425,6 +425,60 @@ const TYPE_LABELS = {
   aromatouch: 'AromaTouch',
 };
 
+// ── QUESTIONNAIRE AVANT SOIN (AromaTouch) ─────────────────────────────────────
+// Rempli par la cliente au moment de réserver : cinq questions fermées et une
+// précision libre facultative. Ce sont des données de santé (RGPD, art. 9) :
+// elles ne sont acceptées qu'avec un consentement explicite, restent sur la
+// réservation (ni détail dans la notification push, ni agenda iCloud, ni export
+// CSV) et disparaissent avec l'identité lors de l'anonymisation.
+//
+// Facultatif côté serveur : une page restée en cache chez un visiteur, ou un RDV
+// saisi par Mathilde depuis l'app, réservent sans questionnaire.
+const QUESTIONNAIRE_KEYS = ['tension', 'verrues', 'mycose', 'grossesse', 'traitement'];
+const QUESTIONNAIRE_DETAILS_MAX = 1000;
+
+/// Renvoie `{ error }`, ou `{ value }` : le questionnaire normalisé, ou `null`
+/// s'il est absent. Rien d'autre que les clés attendues n'est recopié en base.
+function parseQuestionnaire(raw) {
+  if (raw === undefined || raw === null) return { value: null };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return { error: 'Questionnaire invalide' };
+  if (raw.consent !== true) {
+    return { error: 'Merci d\'accepter que vos réponses soient transmises à Mathilde' };
+  }
+
+  const answers = {};
+  for (const key of QUESTIONNAIRE_KEYS) {
+    const value = raw.answers?.[key];
+    if (value !== 'oui' && value !== 'non') {
+      return { error: 'Merci de répondre à chaque question du questionnaire' };
+    }
+    answers[key] = value;
+  }
+
+  let details = '';
+  if (raw.details !== undefined && raw.details !== null) {
+    if (typeof raw.details !== 'string') return { error: 'Précision invalide' };
+    details = raw.details.trim();
+    if (details.length > QUESTIONNAIRE_DETAILS_MAX) {
+      return { error: `Précision trop longue (${QUESTIONNAIRE_DETAILS_MAX} caractères maximum)` };
+    }
+  }
+
+  return {
+    value: {
+      answers,
+      ...(details ? { details } : {}),
+      consentedAt: new Date().toISOString(),
+    },
+  };
+}
+
+/// Un « oui » ou une précision écrite : Mathilde doit lire avant le soin.
+function questionnaireNeedsAttention(questionnaire) {
+  if (!questionnaire) return false;
+  return Object.values(questionnaire.answers).includes('oui') || !!questionnaire.details;
+}
+
 // ── ÉTAT D'UNE SÉANCE (présence, encaissement, note de suivi) ─────────────────
 //
 // Principe : une séance passée est présumée **honorée et réglée au tarif
@@ -1095,11 +1149,12 @@ async function purgeExpiredPersonalData() {
           phone: '',
           anonymisedAt: new Date().toISOString(),
         },
-        // La note de suivi est la donnée la plus sensible du dossier : elle doit
-        // disparaître, pas survivre à l'anonymisation de l'identité. Les données
-        // comptables (montant, règlement) sont conservées — elles n'identifient
-        // personne et l'obligation de conservation comptable est plus longue.
-        $unset: { 'session.note': '' },
+        // La note de suivi et le questionnaire avant soin sont les données les
+        // plus sensibles du dossier : ils doivent disparaître, pas survivre à
+        // l'anonymisation de l'identité. Les données comptables (montant,
+        // règlement) sont conservées — elles n'identifient personne et
+        // l'obligation de conservation comptable est plus longue.
+        $unset: { 'session.note': '', questionnaire: '' },
       }
     );
     count += result.modifiedCount;
@@ -1295,6 +1350,10 @@ app.post('/api/book', wrap(async (req, res) => {
   if (giftCode !== undefined && giftCode !== null && typeof giftCode !== 'string') {
     return res.status(400).json({ error: 'Code cadeau invalide' });
   }
+  const { error: questionnaireError, value: questionnaire } = parseQuestionnaire(req.body.questionnaire);
+  if (questionnaireError) {
+    return res.status(400).json({ error: questionnaireError });
+  }
 
   const conflictError = await checkSlotAvailable(date, startTime, endTime, type);
   if (conflictError) {
@@ -1320,6 +1379,7 @@ app.post('/api/book', wrap(async (req, res) => {
     phone:     phone.trim(),
     status: 'confirmed',
     giftCode: giftCert,
+    ...(questionnaire ? { questionnaire } : {}),
     createdAt: new Date().toISOString(),
   };
 
@@ -1355,9 +1415,12 @@ app.post('/api/book', wrap(async (req, res) => {
   const prefs = await getPrefs();
   if (prefs.newBooking) {
     const typeLabel = TYPE_LABELS[type] || type;
+    // La notification s'affiche sur l'écran verrouillé : elle signale qu'il y a
+    // quelque chose à lire, jamais ce que la cliente a répondu.
+    const attention = questionnaireNeedsAttention(questionnaire) ? ' · questionnaire à lire' : '';
     sendPush(
       'Nouveau RDV',
-      `${booking.firstName} ${booking.lastName} — ${booking.date} à ${booking.startTime} (${typeLabel})`
+      `${booking.firstName} ${booking.lastName} — ${booking.date} à ${booking.startTime} (${typeLabel})${attention}`
     ).catch(e => console.error('Erreur envoi push :', e.message));
   }
 }));
@@ -2117,8 +2180,9 @@ app.delete('/api/admin/clients/:email', requireAuth, wrap(async (req, res) => {
           phone: '',
           anonymisedAt: new Date().toISOString(),
         },
-        // Idem purge automatique : la note de suivi part avec l'identité.
-        $unset: { 'session.note': '' },
+        // Idem purge automatique : la note de suivi et le questionnaire avant
+        // soin partent avec l'identité.
+        $unset: { 'session.note': '', questionnaire: '' },
       }
     )).modifiedCount;
   }
